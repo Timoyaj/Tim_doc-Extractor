@@ -17,13 +17,14 @@ with **Ollama** as the only inference backend.
 - **The one hard constraint:** on CPU, *reading context* (prefill) is as expensive as
   writing the answer. Every architectural decision below exists to keep context small,
   keep exactly one model busy, and make 30–60 s waits feel intentional instead of broken.
-- **Recommended model defaults:** `qwen3:4b` (thinking off) or `phi4-mini:3.8b` at Q4_K_M
-  for chat; `nomic-embed-text` (768-d) for embeddings. Step down to a 1.7B model on weak
-  hardware, up to 8B only with 16 GB RAM.
+- **Recommended model defaults for the 12 GB / 512 GB SSD target:** `qwen3:4b` (thinking
+  off) for interactive chat, `nomic-embed-text` (768-d) for embeddings, and `qwen3:8b` as an
+  opt-in **quality mode** for background generation only. 12 GB is the threshold where an 8B
+  model becomes viable — but at ~6–8 tok/s, so it belongs in batch work, not chat. See §2.1.
 - **Build vs. adopt:** two mature open-source NotebookLM clones already exist. Use them for
-  a demo, but **build the lean core** if the target is an 8 GB CPU-only machine — the
-  existing stacks carry Docker + a database server + a generic multi-provider layer you
-  don't need, and none of them are tuned for one-at-a-time CPU inference. Details in §4.
+  a demo, but **build the lean core** — the existing stacks carry Docker + a database server
+  + a generic multi-provider layer you don't need, and none of them are tuned for
+  one-at-a-time CPU inference. Details in §4.
 - **v1 scope:** sources, grounded chat with verified citations, per-source summaries,
   notes, search, job queue. Later: study artifacts, audio, OCR, reranking.
 - **Effort:** ~2–3 weeks part-time for v1 (§12).
@@ -34,16 +35,67 @@ with **Ollama** as the only inference backend.
 
 | Assumption | Value used in this plan | Why it matters |
 |---|---|---|
-| Target machine | 8 GB RAM, 4 physical cores, no GPU, SSD | Sets model tier, context size, memory math |
+| Target machine | **12 GB RAM, 512 GB SSD, no GPU** | Sets model tier, context size, memory math |
+| CPU | 4–6 physical cores (**still to confirm**) | Sets `num_thread` and prefill speed |
+| Memory channel | **Unknown — often single-channel on 12 GB** (§2.1) | Halves decode speed if single |
 | OS | Windows or Linux (native, not WSL/Docker) | Packaging and how Ollama env vars are set |
 | Users | Single user, localhost only | No auth, no multi-tenancy, no concurrency |
 | Network | Offline after setup; model downloads are the only big transfer | Rules out cloud fallbacks and web crawling by default |
 | Documents | Mostly English PDF + DOCX + pasted text; some scanned PDFs | Extraction and embedding choices |
-| Priority | Privacy + zero cost > raw quality | Accepts slower, smaller models |
+| Priority | Privacy + zero cost > speed > max quality | Accepts slower, smaller models |
 
-**If the machine has 16 GB:** move to 7–8B Q4 for noticeably better synthesis; everything
-else in this plan is unchanged. **If it has 4 GB:** use a 1.7B model, 2k context, and
-expect 20–40 s answers; consider dropping semantic search to keyword-only.
+### 2.1 Hardware profile: 12 GB RAM + 512 GB SSD
+
+12 GB is an odd but workable size — it is often **4 GB soldered + 8 GB stick**, which means
+**single-channel memory**. That matters more than the CPU model: CPU decode is
+memory-bandwidth-bound, and single-channel roughly halves throughput. Check this before
+choosing a model.
+
+```powershell
+# Windows — slots used, per-stick size/speed, and CPU topology
+Get-CimInstance Win32_PhysicalMemory | Select BankLabel,Capacity,Speed,DeviceLocator
+Get-CimInstance Win32_Processor | Select Name,NumberOfCores,NumberOfLogicalProcessors
+```
+```bash
+# Linux
+sudo dmidecode -t memory | grep -E "Size|Speed|Locator|Configured Memory Speed"
+lscpu | grep -E "^CPU\(s\)|Core|Thread|Model name"
+```
+
+Interpretation: **one row** in the memory table = single-channel. Effective bandwidth is
+roughly 17–19 GB/s single-channel DDR4-3200 vs ~35–40 GB/s dual.
+
+**Expected decode speed** ≈ effective bandwidth ÷ model size (then knock off 10–25% for KV
+cache and sampling overhead):
+
+| Model (Q4_K_M) | Weights | Single-channel DDR4 | Dual-channel DDR4 |
+|---|---|---|---|
+| 1.7B | ~1.4 GB | 10–14 tok/s | 20–28 tok/s |
+| 4B | ~2.6 GB | 5–7 tok/s | 10–14 tok/s |
+| 8B | ~5.2 GB | 3–4 tok/s | 6–8 tok/s |
+
+Treat these as ±30% — the bake-off in Appendix B replaces them with measurements.
+
+**Memory budget.** With 12 GB you have ~9 GB usable after OS + browser. Two supported modes:
+
+| Mode | Resident models | Total RSS | Use it for |
+|---|---|---|---|
+| **Snappy (default)** | `qwen3:4b` + `nomic-embed-text` | ~3.5–4 GB | Interactive chat, all day |
+| **Quality (opt-in)** | `qwen3:8b` + `nomic-embed-text` | ~6.5–7 GB | Digests, study guides, artifacts, "deep answer" |
+| Never both | 4B + 8B + embed | ~9.5 GB | Thrash: Ollama will reload models constantly |
+
+So the app gets a **model tier setting**, not a single model: 4B answers questions, 8B
+generates artifacts in the background while the user is reading. Do not keep both chat models
+loaded — it defeats the purpose of having 12 GB.
+
+**Disk (512 GB SSD).** Models are 1.5–5.2 GB each; a realistic set (4B + 8B + 1.7B
+fallback + embeddings) is ~13 GB. Keep `OLLAMA_MODELS` on the internal SSD (a USB HDD adds
+~20 s to every cold load). The document library is small: 500 PDFs averaging 5 MB ≈ 2.5 GB,
+plus SQLite. Backups stay trivial.
+
+**Swap/pagefile.** Don't disable it, but never size a workload to *need* it. If RSS exceeds
+~10 GB, Ollama thrashes and a 6 tok/s model becomes a 0.5 tok/s model. The memory guard in
+§9.3 exists for this.
 
 ---
 
@@ -61,8 +113,8 @@ surface area.
    click a citation → the exact passage opens with the source scrolled and highlighted.
 5. **Notes**: manual notes + "save this answer as a note"; export notebook to Markdown.
 6. **Search**: keyword + semantic across all sources, results jump to the passage.
-7. **Settings/health**: pick chat & embedding models, context size, threads; show Ollama
-   status, loaded model, measured tok/s.
+7. **Settings/health**: pick model tier (snappy / quality / tiny) and embedding model, context
+   size, threads; show Ollama status, resident models, measured tok/s.
 
 ### v2 — the "studio"
 
@@ -87,7 +139,7 @@ prove the product.
 
 ## 4. Build vs. adopt (decide this first)
 
-| Option | What it is | Strengths | Costs on an 8 GB CPU box |
+| Option | What it is | Strengths | Costs on a 12 GB CPU-only box |
 |---|---|---|---|
 | **Open Notebook** (`lfnovo/open-notebook`, MIT, ~41k★) | Full NotebookLM clone: FastAPI + TypeScript UI + SurrealDB, Ollama among 20+ providers, podcasts, transformations | Feature-complete today; active (v1.15, Oct 2026); REST API | Docker + SurrealDB + app container; multi-provider abstraction; needs `OPEN_NOTEBOOK_WORKER_MAX_TASKS=1` to avoid parallel LLM calls; heavier RAM/disk footprint; less control over prompt/context tuning |
 | **SurfSense** (`MODSetter/SurfSense`, Apache-2.0, ~17k★) | Air-gapped research agent; Python + Next.js + Postgres/pgvector | Strong ingestion, agentic research, self-hosted | Postgres + pgvector + web frontend + more services; agentic loops are latency-heavy on CPU |
@@ -153,7 +205,7 @@ good at headings and page anchoring; `markitdown` covers DOCX/PPTX/XLSX.
   comfortable. If extension loading is a problem on your Python build, store vectors as
   BLOBs and brute-force in NumPy — 20k × 768 floats is ~60 MB and a query is ~30 ms. Start
   with whichever, keep the retrieval interface narrow so you can swap.
-- **No Docker on the target machine.** Docker Desktop on 8 GB Windows/WSL2 costs 1–2 GB and
+- **No Docker on the target machine.** Docker Desktop on Windows/WSL2 costs 1–2 GB and
   muddies CPU thread control. Ship a `run.bat` / `run.sh` + `pip install`.
 
 ---
@@ -307,7 +359,9 @@ One call per source producing strict JSON:
 
 Use Ollama structured outputs (`format` = JSON schema) to make parsing reliable even on 3B
 models. If validation fails, retry once with a shorter chunk sample, then fall back to a
-plain-text summary. Generate **after** chat-critical work is idle.
+plain-text summary. Run these on the **quality tier** (`qwen3:8b`) — nobody is waiting for
+them — but only after chat-critical work is idle, and never while a snappy-tier answer is
+being generated (that would force a model swap).
 
 ### 7.5 Failure handling
 
@@ -396,7 +450,7 @@ Server-level (set once, restart Ollama):
 | Variable | Value | Reason |
 |---|---|---|
 | `OLLAMA_NUM_PARALLEL` | `1` | Never split cores between requests |
-| `OLLAMA_MAX_LOADED_MODELS` | `2` | Chat + embedding coexist; `1` if RAM-tight (causes reload churn) |
+| `OLLAMA_MAX_LOADED_MODELS` | `2` | Exactly chat + embedding on this machine; the app never loads two chat models |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Model reload from disk is 5–20 s; don't pay it per question |
 | `OLLAMA_FLASH_ATTENTION` | `1` (measure) | Helps on some CPUs, hurts on others |
 | `OLLAMA_KV_CACHE_TYPE` | `q8_0` (optional) | Halves KV-cache RAM; verify quality on your build |
@@ -426,20 +480,24 @@ Per request (`options` in `/api/chat`):
 try the P-core count. Never leave `num_ctx` unset and assume 8k — Ollama allocates KV cache
 for the full window, and the default has changed across versions; set it explicitly.
 
-### 9.2 Memory math (8 GB machine)
+### 9.2 Memory math (12 GB machine, ~9 GB usable)
 
-| Component | Approx. RSS |
-|---|---|
-| 3–4B Q4_K_M weights | 2.0–2.6 GB |
-| KV cache @ 4096 ctx | 0.3–0.6 GB |
-| Embedding model (137M) | 0.2–0.3 GB |
-| Python app + SQLite | 0.15–0.3 GB |
-| Browser tab | 0.4–1.0 GB |
-| **Total** | **~3.5–5 GB** — fits with headroom |
+| Component | 4B mode | 8B mode |
+|---|---|---|
+| Chat weights Q4_K_M | 2.4 GB | 5.2 GB |
+| KV cache @ 4096 ctx | 0.4 GB | 0.7 GB |
+| Embedding model (137M) | 0.3 GB | 0.3 GB |
+| Python app + SQLite | 0.2 GB | 0.2 GB |
+| Browser tab | 0.6 GB | 0.6 GB |
+| **Total** | **~3.9 GB** | **~7.0 GB** |
+| Headroom on 12 GB | ~8 GB | ~5 GB |
 
-An 8B Q4 (~5.2 GB weights + 0.6 GB KV) plus browser pushes an 8 GB machine into swap, and
-swap turns a 6 tok/s model into a 0.5 tok/s model. That is the entire reason the 8 GB tier
-is capped at ~4B.
+Both modes fit. What does **not** fit is 4B + 8B loaded together (~9.6 GB) with a browser on
+top — that is the swap cliff. Enforce it in code: one chat model resident at a time, and
+`OLLAMA_MAX_LOADED_MODELS=2` covers exactly chat + embedding.
+
+An 8B on an **8 GB** machine would have pushed into swap; 12 GB is precisely the threshold
+where 8B becomes usable for background work while the UI stays responsive.
 
 ### 9.3 Scheduling rules
 
@@ -450,24 +508,33 @@ is capped at ~4B.
 - Warm the chat model on app start with a 1-token request, so the first real question isn't
   20 s slower than every subsequent one.
 - Pause background jobs on battery (optional, but laptops throttle hard and users blame the app).
-- Surface measured `tok/s`, `prompt_eval_count`, and queue depth in a footer. It sets
-  expectations and is the first diagnostic when something feels wrong.
+- **Pin the tier per job.** A job declares `tier: snappy | quality` and keeps that model for
+  its whole run. Switching mid-job reloads 5 GB from disk and stalls everything.
+- **Memory guard.** Before loading a model, read `ollama ps`; if requested + resident exceeds
+  ~8.5 GB, unload the idle model first (`keep_alive: 0` on an empty request) rather than
+  letting the OS swap.
+- Surface measured `tok/s`, `prompt_eval_count`, `ollama ps` resident size, and queue depth
+  in a footer. It sets expectations and is the first diagnostic when something feels wrong.
 
-### 9.4 Latency budget (reference: 4 cores, 4B Q4, 4k ctx) — estimates to verify
+### 9.4 Latency budget (12 GB, 4–6 cores, 4k ctx) — estimates to verify
 
-| Operation | Estimate |
-|---|---|
-| Model load (cold, SSD) | 3–15 s, once per session |
-| Ingest 100-page PDF: extract + chunk | 3–8 s |
-| Embed ~350 chunks @ 80/s | ~5 s |
-| Digest summary (250 tokens @ 12 tok/s) | ~25 s (background) |
-| Query: embed + retrieve | < 0.2 s |
-| Prefill 2.5k tokens @ ~60–100 tok/s | 25–40 s |
-| Generate 180 tokens @ 10–15 tok/s | 12–18 s |
-| **First token** | **~25 s; full answer ~40–55 s** |
+Dual-channel figures; on single-channel, generation is ~2× slower (see §2.1).
 
-With a 1.7B model, roughly halve both phases. With an 8B on 8 GB, double it and add swap
-pain. **Design the UI for 30–60 s answers**, not for 3 s ones.
+| Operation | 4B (snappy) | 8B (quality) |
+|---|---|---|
+| Model load (cold, SSD) | 3–8 s | 6–15 s |
+| Ingest 100-page PDF: extract + chunk | 3–8 s | 3–8 s |
+| Embed ~350 chunks @ 80/s | ~5 s | ~5 s |
+| Digest summary (250 tokens) | ~20 s | ~35 s |
+| Query: embed + retrieve | < 0.2 s | < 0.2 s |
+| Prefill 2.5k tokens | 20–35 s | 40–60 s |
+| Generate 180 tokens | 13–18 s (10–14 tok/s) | 23–30 s (6–8 tok/s) |
+| **First token / full answer** | **~20 s / ~40 s** | **~45 s / ~85 s** |
+
+**Design the UI for 30–60 s answers**, not for 3 s ones. The 8B is 2× slower, so it is
+reserved for work the user is not staring at: source digests, study guides, FAQ generation,
+"deep answer" when they explicitly ask and are willing to wait. If a question needs to feel
+instant, the 1.7B model plus 3 retrieved chunks gets close to 15 s end to end.
 
 ---
 
@@ -576,22 +643,24 @@ change; a "better" model that doubles latency may be the wrong trade on this mac
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Too slow to use (30–90 s answers) | High | 1.7–4B models, 4k ctx, 5 chunks, streaming stages, cache digests, one-at-a-time gate |
+| Too slow to use (30–90 s answers) | High | 4B for chat, 8B only for background work, 4k ctx, 5 chunks, streaming stages, cached digests, one-at-a-time gate |
 | Hallucinated citations | High | Validate markers, overlap scoring, strict mode, refusal threshold, visible warnings |
-| 8B model chosen and machine swaps | Medium | Hard-cap model recommendations by detected RAM at setup; show RSS in health panel |
+| 8B tier leaves too little RAM (12 GB is the floor for it) | Medium | Tier is a setting with an enforced memory guard (§9.3); never load two chat models; show `ollama ps` resident size in the health panel |
 | Prompt injection from documents | Medium | Sources are data; no tools/shell/web in v1; system prompt states the rule; never auto-execute links |
 | Scanned PDFs → OCR time bomb | Medium | Detect early, mark `needs_ocr`, make OCR an explicit opt-in with an ETA |
 | Thermal throttling on laptops | Medium | Pause background jobs on battery; batch ingestion; show tok/s so users see throttling |
 | Docker/DB stack eats the RAM budget | Medium | Don't use it (see §4); native Python + SQLite |
 | Embedding model changed → stale vectors | Low | Version vectors in settings; background re-embed; block chat until consistent |
 | Scope creep into podcast/video/agents | High | v1 non-goals list; audio is M5 and narration-only |
+| Single-channel RAM halves expected speed | Medium | Measure with the bake-off (§Appendix B) before committing; 12 GB laptops are often 4+8 GB sticks |
 | Model licensing surprises | Low | Prefer Apache-2.0 (Qwen) / MIT-family; check Gemma and Llama terms before redistribution |
 
 ---
 
 ## 15. Open decisions for you
 
-1. **Hardware:** exact RAM, CPU (cores/threads), OS, SSD or HDD? This sets the default model.
+1. ~~**Hardware:**~~ **Answered:** 12 GB RAM, 512 GB SSD, no GPU → see §2.1. Still needed:
+   **CPU core count** and **single vs. dual channel** (run the two commands in §2.1), plus OS.
 2. **Documents:** mostly text PDFs, or scanned/office-heavy? Any non-English sources?
 3. **Build or adopt:** greenfield lean app, or run Open Notebook first and fork later?
 4. **UI stack:** no-build htmx (leanest) vs. React (nicer to extend)?
@@ -627,16 +696,28 @@ Measures *your* machine instead of trusting blog numbers. Run with Ollama runnin
 
 ```python
 # scripts/bakeoff.py
-import json, time, urllib.request
+import json, os, time, urllib.request
 
 HOST = "http://127.0.0.1:11434"
+THREADS = int(os.environ.get("THREADS", os.cpu_count() // 2 or 1))  # set to physical cores
+
+
+def resident_models():
+    """Ask Ollama what is loaded and how big it is (RAM guard / swap check)."""
+    try:
+        r = json.load(urllib.request.urlopen(f"{HOST}/api/ps", timeout=10))
+        return [(m["name"], round(m.get("size", 0) / 1e9, 2)) for m in r.get("models", [])]
+    except Exception:
+        return []
+
+
 LONG = ("The quarterly report shows revenue increased twelve percent while churn fell. " * 90)
 
 def chat(model, prompt, num_ctx=4096):
     body = json.dumps({
         "model": model, "stream": False, "think": False,
         "messages": [{"role": "user", "content": prompt}],
-        "options": {"num_ctx": num_ctx, "num_thread": 4, "num_predict": 120,
+        "options": {"num_ctx": num_ctx, "num_thread": THREADS, "num_predict": 120,
                     "temperature": 0.2},
     }).encode()
     req = urllib.request.Request(f"{HOST}/api/chat", body,
@@ -644,8 +725,6 @@ def chat(model, prompt, num_ctx=4096):
     t0 = time.time()
     r = json.load(urllib.request.urlopen(req, timeout=600))
     wall = time.time() - t0
-    out_tok = r.get("eval_count", 0) / 1e9
-    pre_tok = r.get("prompt_eval_count", 0) / 1e9
     return {
         "model": model,
         "gen_tok_s": round(r["eval_count"] / (r["eval_duration"] / 1e9), 1),
@@ -653,10 +732,12 @@ def chat(model, prompt, num_ctx=4096):
         "wall_s": round(wall, 1),
         "prompt_tokens": r["prompt_eval_count"],
         "answer": r["message"]["content"][:160].replace("\n", " "),
+        "resident_gb": resident_models(),
     }
 
 if __name__ == "__main__":
-    for m in ["qwen3:1.7b", "qwen3:4b", "phi4-mini:3.8b", "llama3.2:3b"]:
+    print(f"threads={THREADS}  loaded={resident_models()}")
+    for m in ["qwen3:1.7b", "qwen3:4b", "qwen3:8b", "phi4-mini:3.8b"]:
         try:
             print(json.dumps(chat(m, "Summarize in one sentence: " + LONG), indent=2))
         except Exception as e:
@@ -666,23 +747,37 @@ if __name__ == "__main__":
 Judge on **prefill tok/s** as much as generation speed — it dominates the wait. A model that
 generates 20 tok/s but prefills at 40 tok/s will feel worse than one at 12/150.
 
+One caveat on quantisation: keep `num_ctx` identical across runs, or you are measuring KV-cache
+allocation instead of the model. And if a **mixture-of-experts** model happens to fit in 12 GB
+at a low quant, benchmark it — MoE decodes at roughly *active*-parameter speed, so a 20B MoE
+with ~3B active can beat a dense 8B on tokens/second. Do not plan around it; measure it.
+
 ## Appendix C — Recommended starting configuration
 
 ```json
 {
-  "chat_model": "qwen3:4b",
-  "chat_fallback": "phi4-mini:3.8b",
+  "hardware_profile": "12gb_cpu",
+  "tiers": {
+    "snappy":  {"chat_model": "qwen3:4b",       "num_ctx": 4096, "num_predict": 350},
+    "quality": {"chat_model": "qwen3:8b",       "num_ctx": 4096, "num_predict": 700},
+    "tiny":    {"chat_model": "qwen3:1.7b",     "num_ctx": 2048, "num_predict": 250}
+  },
+  "default_tier": "snappy",
+  "artifact_tier": "quality",
   "embed_model": "nomic-embed-text",
-  "num_ctx": 4096,
   "num_thread": 4,
-  "num_predict": 350,
+  "num_batch": 128,
   "retrieve": {"fts_k": 40, "vec_k": 40, "rrf_k": 60, "top_n": 5, "max_per_source": 3},
   "chunk": {"target_tokens": 480, "overlap_tokens": 70, "min_tokens": 120},
   "strict_citations": true,
   "rerank": false,
-  "keep_alive": "30m"
+  "keep_alive": "30m",
+  "memory_guard_gb": 8.5
 }
 ```
+
+`num_thread` should be set to the *physical* core count reported by the command in §2.1 —
+4 is the conservative default.
 
 ## Appendix D — Repo layout
 
@@ -705,7 +800,7 @@ Tim_doc-Extractor/
 
 ## Appendix E — Definition of done for v1
 
-On a clean 8 GB machine with only Ollama installed: add five mixed sources, watch progress,
+On a clean 12 GB machine with only Ollama installed: add five mixed sources, watch progress,
 ask ten questions, get answers in under 90 s each with valid clickable citations, save two
 notes, export the notebook to Markdown, restart the app and resume a half-finished
 ingestion — all with the network cable unplugged.
