@@ -10,7 +10,8 @@ them, and get answers with clickable citations — powered by a local model thro
 
 ## The short version
 
-- One Python process, one SQLite file, one browser tab. No Docker, no Postgres, no cloud.
+- One Python process, one SQLite file, one browser tab. No Docker, no Postgres, no cloud
+  by default.
 - Tuned for the actual target box: **Windows 11, 12 GB RAM, 512 GB SSD, 4-core 10th-gen
   Intel, no discrete GPU.** Two tiers instead of one: `qwen3:1.7b` for quick answers (~25 s),
   `qwen3:4b` for real questions and digests (~50 s), `nomic-embed-text` for embeddings. The
@@ -19,6 +20,19 @@ them, and get answers with clickable citations — powered by a local model thro
 - Hybrid keyword + vector retrieval, strict citation checking, and a single-inference gate so
   the CPU is never split between jobs.
 - Honest UX for 30–60 second answers: stage indicators, token streaming, a working stop button.
+- **Optional free cloud models** via [OmniRoute](https://github.com/cheaper-inference/OmniRoute),
+  a local MIT-licensed gateway on `127.0.0.1:20128`. When the 1.7B/4B model isn't enough, one
+  click answers the same question with a 70B-class free model in a few seconds. **Off by
+  default**, per notebook, and every answer is labelled with who produced it — see
+  [PLAN.md §10](PLAN.md#10-optional-online-mode-free-models-via-omniroute).
+
+## Local by default
+
+The app is designed to work with the network cable unplugged. Documents, chunks, embeddings,
+notes and the search index never leave the machine. Online mode is a **per-notebook policy**
+(`local_only` by default), and even when enabled only the 3–6 retrieved chunks for a single
+question are sent — never a whole document, never the index. Embeddings are always computed
+locally. See [PLAN.md §10.1](PLAN.md#101-the-trade-stated-plainly) for the trade in full.
 
 ## Quick start (once v1 exists)
 
@@ -31,6 +45,9 @@ py -3.12 -m venv .venv
 .venv\Scripts\activate
 pip install fastapi uvicorn pymupdf4llm markitdown trafilatura sqlite-vec psutil httpx
 python -m timnb                 # http://127.0.0.1:8765
+
+# optional: free cloud models when the local 4B isn't enough
+npm i -g omniroute && omniroute    # gateway + dashboard on :20128
 ```
 
 First read [PLAN.md §9.5](PLAN.md#95-windows-11-specifics-do-these-once-in-this-order) — four
@@ -46,8 +63,9 @@ of OneDrive) that save hours. Tune the defaults with the
 | M1 | Vertical slice: upload → chunk → retrieve → grounded answer |
 | M2 | Usable app: queue, UI, streaming, citation drawer, notes |
 | M3 | Digests and studio artifacts (FAQ, study guide, timeline, mind map) |
-| M4 | Evaluation harness, OCR, packaging |
-| M5 | Audio overview via local TTS (optional) |
+| M4 | Optional free-cloud backend via OmniRoute (egress guard, attribution, audit) |
+| M5 | Evaluation harness, OCR, packaging |
+| M6 | Audio overview via local TTS (optional) |
 
-See [PLAN.md §15](PLAN.md#15-open-decisions-for-you) for the open decisions that shape the
+See [PLAN.md §16](PLAN.md#16-open-decisions-for-you) for the open decisions that shape the
 defaults — hardware, document mix, build-vs-adopt, and UI stack.

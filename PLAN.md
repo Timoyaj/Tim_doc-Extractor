@@ -23,13 +23,20 @@ with **Ollama** as the only inference backend.
   browser resident it lands right at the 12 GB edge and decodes at 2–3 tok/s. See §2.1–2.2.
 - **Context budget is the headline:** 3 retrieved chunks, 120-word answers, `num_ctx` 3072 →
   ~50 s per answer on the 4B and ~25 s on the 1.7B, instead of ~95 s with the generic settings.
+- **Optional free cloud models (§10).** [OmniRoute](https://github.com/cheaper-inference/OmniRoute)
+  is an MIT-licensed local gateway exposing an OpenAI-compatible `127.0.0.1:20128/v1` endpoint
+  in front of 90+ free provider tiers. It gives a 70B-class model at 2–6 s per answer when the
+  4B isn't enough — at the cost of sending the retrieved chunks off the machine. **Off by
+  default**, per-notebook, with a "better answer" button rather than a silent upgrade.
+- **Embeddings never leave the machine.** Even in online mode, only 3–6 retrieved chunks per
+  question are sent; the index, titles, notes and history stay local (§10.1, §10.6).
 - **Build vs. adopt:** two mature open-source NotebookLM clones already exist. Use them for
   a demo, but **build the lean core** — the existing stacks carry Docker + a database server
   + a generic multi-provider layer you don't need, and none of them are tuned for
   one-at-a-time CPU inference. Details in §4.
 - **v1 scope:** sources, grounded chat with verified citations, per-source summaries,
-  notes, search, job queue. Later: study artifacts, audio, OCR, reranking.
-- **Effort:** ~2–3 weeks part-time for v1 (§12).
+  notes, search, job queue. Later: studio artifacts, optional cloud backend, audio, OCR.
+- **Effort:** ~2–3 weeks part-time for v1 (§13); +2–3 evenings for the optional cloud backend.
 
 ---
 
@@ -42,7 +49,8 @@ with **Ollama** as the only inference backend.
 | Memory channel | **Unknown — likely single-channel** (§2.1) | Roughly halves decode speed if single |
 | OS | **Windows 11** (native, not WSL/Docker) | Packaging, env vars, Defender, power policy |
 | Users | Single user, localhost only | No auth, no multi-tenancy, no concurrency |
-| Network | Offline after setup; model downloads are the only big transfer | Rules out cloud fallbacks and web crawling by default |
+| Network | Offline after setup; model downloads are the only big transfer | Local-first is the default; online mode is opt-in (§10) |
+| Inference backends | Ollama on `127.0.0.1:11434` (primary); optional OmniRoute gateway on `127.0.0.1:20128` | Egress is a per-notebook policy, default `local_only` |
 | Documents | Mostly English PDF + DOCX + pasted text; some scanned PDFs | Extraction and embedding choices |
 | Priority | Privacy + zero cost > speed > max quality | Accepts slower, smaller models |
 
@@ -162,6 +170,7 @@ surface area.
 - Source-scoped chat ("chat with this one document"), highlight-to-ask.
 - Strict/quote-first answering mode; per-answer confidence and unsupported-claim warnings.
 - Multi-document compare and synthesis; saved prompts.
+- Optional free cloud backend for the hard questions (§10) — opt-in, attributed, audited.
 
 ### v3 — nice-to-have, CPU-hostile
 
@@ -193,6 +202,11 @@ generic multi-provider stack abstracts away.
 **Contingency:** if you need podcasts/multimodal/30 formats *this week*, run Open Notebook,
 point it at Ollama, set `OPEN_NOTEBOOK_WORKER_MAX_TASKS=1`, and keep 4 GB free. Revisit a
 custom build only if it feels slow.
+
+**If you want the free-cloud option (§10) without building:** Open Notebook accepts any
+OpenAI-compatible server, so pointing it at OmniRoute works today with no code. That is a
+genuinely fast path to "NotebookLM-ish, with free frontier models" — and exactly why the
+feature belongs in this plan as a *deliberate, measurable* trade rather than a side effect.
 
 **Also:** do not write your own PDF parser. `PyMuPDF` / `pymupdf4llm` is fast, pure-CPU, and
 good at headings and page anchoring; `markitdown` covers DOCX/PPTX/XLSX.
@@ -241,6 +255,9 @@ good at headings and page anchoring; `markitdown` covers DOCX/PPTX/XLSX.
   a priority queue — interactive chat first, artifacts last — and it gives us a single place
   to cancel work, count tokens, and avoid RAM spikes from overlapping models.
 - **SSE, not WebSockets.** One-way token streaming, survives proxies, trivial to debug.
+- **One optional second backend, behind one guard.** §10 adds an OpenAI-compatible client for
+  OmniRoute. Every outbound call passes a single egress check keyed on the notebook's policy, so
+  "is this local or remote?" is decided in one function, not sprinkled through the pipeline.
 - **Vectors in SQLite.** `sqlite-vec` is a loadable extension with KNN in C; 100k chunks is
   comfortable. If extension loading is a problem on your Python build, store vectors as
   BLOBs and brute-force in NumPy — 20k × 768 floats is ~60 MB and a query is ~30 ms. Start
@@ -262,6 +279,8 @@ PRAGMA busy_timeout = 5000;
 
 CREATE TABLE notebooks (
   id TEXT PRIMARY KEY, name TEXT NOT NULL,
+  egress_policy TEXT NOT NULL DEFAULT 'local_only',  -- local_only | escalate_on_demand | cloud_allowed
+  backend_default TEXT NOT NULL DEFAULT 'ollama',    -- ollama | omniroute
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   settings_json TEXT NOT NULL DEFAULT '{}'
 );
@@ -319,6 +338,9 @@ CREATE TABLE messages (
   content TEXT NOT NULL,
   citations_json TEXT,                -- [{sid, page, chunk_id, quote, verified}]
   model TEXT,
+  backend TEXT DEFAULT 'ollama',      -- who answered
+  served_by TEXT,                     -- X-OmniRoute-Decision (provider/model/latency)
+  complete INTEGER NOT NULL DEFAULT 1,-- 0 = stream died mid-answer (§10.5)
   prompt_tokens INTEGER, output_tokens INTEGER, latency_ms INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -341,7 +363,32 @@ CREATE TABLE artifacts (
 );
 
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- §10: optional cloud backend. Keys are NOT stored here — only a reference (§10.8).
+CREATE TABLE providers (
+  id TEXT PRIMARY KEY,                -- 'ollama' | 'omniroute'
+  kind TEXT NOT NULL,                 -- 'ollama' | 'openai_compat'
+  base_url TEXT NOT NULL,
+  key_ref TEXT,                       -- Windows Credential Manager target name
+  enabled INTEGER NOT NULL DEFAULT 0,
+  last_ok_at TEXT, last_error TEXT
+);
+
+-- One row per outbound inference call. The audit trail that makes opt-in egress defensible.
+CREATE TABLE egress_log (
+  id INTEGER PRIMARY KEY,
+  message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL, model TEXT,
+  decision TEXT,                      -- X-OmniRoute-Decision
+  chunks_sent INTEGER, prompt_tokens INTEGER, output_tokens INTEGER,
+  redactions INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,               -- ok | rate_limited | failed | blocked_by_policy
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 ```
+
+`egress_log.status = 'blocked_by_policy'` is worth keeping: it records that the guard fired,
+which is the evidence that `local_only` actually means what it says.
 
 FTS5 external-content triggers (`AFTER INSERT/DELETE/UPDATE ON chunks`) keep the index in
 sync. Store `embed_model` and `dim` in `settings`; if either changes, mark all vectors stale
@@ -424,9 +471,10 @@ Dedupe by `sha256` and tell the user which existing source matches.
 5. **Optional rerank (v2):** a small ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, ~22M
    params) over the top 12, ~20–50 ms on CPU, improves precision meaningfully. Keep it
    behind a flag — it is the first thing to disable when the machine feels slow.
-6. **Assemble:** 3 chunks (~1.3k tokens) on this machine, 5 (~2.2k) on faster hardware, with
-   `[S1]…[S#]` labels, source title and page. Chunk count is the biggest latency lever you
-   own — make it a setting with a visible consequence ("more context = slower answer").
+6. **Assemble:** 3 chunks (~1.3k tokens) locally, 6 (~2.6k) when a cloud backend answers, with
+   `[S1]…[S#]` labels, source title and page — or a neutral label in cloud mode (§10.2).
+   Chunk count is the biggest latency lever you own locally — make it a setting with a visible
+   consequence ("more context = slower answer"), and let it vary per backend profile (§10.7).
 
 Query rewriting with the LLM is *not* in the default path: it adds 5–15 s to save maybe 2k
 tokens. Do it only for queries under four words, and only if the user enables "deep mode".
@@ -478,7 +526,7 @@ user has seen the short version.
 Retrieval quality gates generation: if the best fused score is below a calibrated threshold,
 skip the LLM entirely and answer with "I couldn't find this in your sources" + 3 suggested
 questions from the notebook. Saves 40 s and looks intelligent. Calibrate the threshold on
-your own golden set (§13).
+your own golden set (§14).
 
 ### 8.5 Small-model survival tactics
 
@@ -572,6 +620,9 @@ is a narrower gap than the marketing numbers suggest.
   `psutil.virtual_memory().available`, and refuse (or unload the idle model first with
   `keep_alive: 0`) if the request would leave less than ~1 GB free. On a 12 GB Windows 11 box
   that threshold gets hit long before RAM is technically "full", which is the point.
+- **Remote calls bypass the local gate** (they don't compete for cores) but get their own
+  limiter of 2 concurrent requests, and never preempt an in-flight local answer — a half-finished
+  stream is worse than a slow one (§10.5).
 - Surface measured `tok/s`, `prompt_eval_count`, the `ollama ps` `PROCESSOR` and `CONTEXT`
   columns, and queue depth in a footer. It sets expectations and is the first diagnostic when
   something feels wrong.
@@ -672,7 +723,7 @@ python -m timnb
 ```
 
 Bind to `127.0.0.1` so Windows Firewall does not prompt. If LAN access is ever wanted, that is a
-deliberate change: explicit `netsh advfirewall` rule **plus** the auth story from §15.
+deliberate change: explicit `netsh advfirewall` rule **plus** the auth story from §16.
 
 **7. Two small Windows realities.**
 
@@ -689,7 +740,247 @@ working. Resumability is the correct answer; timeouts are the workaround.
 
 ---
 
-## 10. UI
+## 10. Optional online mode: free models via OmniRoute
+
+Everything above keeps documents on the machine. This section adds **one deliberate,
+reversible exception**: a local gateway that can route a question to a free cloud model when
+the user explicitly asks for it.
+
+[OmniRoute](https://github.com/cheaper-inference/OmniRoute) is an MIT-licensed, self-hosted AI
+gateway. `npm i -g omniroute` starts a server on `127.0.0.1:20128` that exposes an
+**OpenAI-compatible** endpoint at `http://127.0.0.1:20128/v1` in front of hundreds of providers,
+90+ of which have free tiers. A fresh install answers with `"model": "auto"` using keyless free
+backends, and it does quota-aware auto-fallback, per-provider circuit breakers, and 429 handling
+for you.
+
+**What it buys on this laptop:** a 70B-class model instead of a 4B, answers in 2–6 s instead of
+~50 s, and study guides in ~15 s instead of ~2 minutes. **What it costs:** the retrieved chunk
+text leaves the machine. That trade is the whole design problem of this section.
+
+```
+  LOCAL (default, always on)                    OPT-IN (egress)
+  ─────────────────────────────                 ─────────────────────────────
+  extract → chunk → embed → SQLite              only retrieved chunks
+        → retrieve 3–6 chunks                          │
+        → inference gate ────────────────────────►  OmniRoute :20128/v1
+                │                                      │ auto-fallback
+                ▼                                      ▼
+          Ollama :11434                          90+ free provider tiers
+          qwen3 1.7B / 4B                        (Claude, GPT, Gemini, Llama…)
+```
+
+### 10.1 The trade, stated plainly
+
+Do not bury this in settings. Write it in the UI, in the README, and in the app's first run.
+
+- **Exposure is bounded by design.** Only the 3–6 chunks retrieved for one question are sent
+  (~1.3–2.6k tokens). The library, embeddings, titles, notes, chat history and the audit log stay
+  local. Retrieval always runs on the local index, so cloud models can never "see" a document
+  that retrieval did not select.
+- **Free tiers are not private.** Many train on submitted data or retain prompts for abuse
+  review; terms vary per provider and change without notice. Some "free forever" backends are
+  unofficial OAuth bridges that may break nightly — or violate the upstream provider's terms.
+- **Therefore it is opt-in, visible, and reversible.** Off by default. Per-notebook policy. A
+  badge on every answer naming who produced it. One switch to go back to local.
+
+Tell users the honest rule: *free cloud models are fine for public papers, textbooks and
+documentation; they are not fine for medical records, contracts under NDA, or anything with
+someone else's personal data.*
+
+### 10.2 Three egress policies
+
+Stored as `notebooks.egress_policy`; enforced at the single place where requests are built.
+
+| Policy | Behaviour | When to use |
+|---|---|---|
+| `local_only` (**default**) | No outbound inference calls ever. Cloud backends are hidden. | Anything sensitive; offline use |
+| `escalate_on_demand` (**recommended**) | Local answers by default; a **"Better answer (free cloud)"** button under each answer re-runs that one question remotely | Best balance: privacy unless the user asks |
+| `cloud_allowed` | Cloud model is the default for this notebook, local is the fallback | Public sources, study material |
+
+`escalate_on_demand` is the sweet spot and should be the one-tap option in the UI — it keeps the
+privacy promise by default while giving the user the escape hatch where it matters: the question
+the 4B model mangled.
+
+**Two egress hygiene rules that are easy to forget:**
+
+1. **Send neutral source labels, not titles.** In cloud mode the prompt uses `[S1] (p.12)`
+   rather than `[S1] (Layoff plan 2026 - draft 3.docx, p.12)`. Filenames are frequently the most
+   sensitive metadata in the whole system, and the model does not need them to answer.
+2. **Optional redaction pass** before egress: regex-mask emails, phone numbers, long digit runs
+   (IDs, card-like numbers), and IBAN-ish strings. Off by default, one toggle, and it should
+   show a diff of what was masked.
+
+### 10.3 Provider abstraction (thin — not a framework)
+
+This is the one place the "no multi-provider layer" advice from §4 has to bend. Keep it to two
+implementations and one interface:
+
+```python
+class ChatBackend(Protocol):
+    name: str                      # "ollama" | "omniroute"
+    is_local: bool                 # drives the egress guard
+    async def stream(self, messages, opts) -> AsyncIterator[Delta]: ...
+    async def models(self) -> list[ModelInfo]: ...
+    async def health(self) -> Health: ...
+
+# OllamaBackend      -> native /api/chat, /api/embed, /api/ps  (num_thread, keep_alive, format)
+# OpenAICompatBackend-> POST /v1/chat/completions, GET /v1/models  (base_url, api_key)
+```
+
+Both stream SSE-shaped JSON; normalize to one `Delta` type (text, done, usage, served_by). The
+egress guard lives in `stream()`: if `not is_local` and the notebook policy is `local_only`,
+raise. One guard, one place to test.
+
+**A tempting shortcut, and why to skip it:** OmniRoute also exposes an Ollama-compatible
+`/api/chat` and `/api/tags`, so you *could* reuse the Ollama client by swapping the base URL.
+Don't — the native options (`num_thread`, `keep_alive`, `format`) are meaningless remotely, and
+you lose `usage`, model metadata and the decision headers that make attribution possible. Use
+the documented OpenAI-compatible path.
+
+### 10.4 Choosing models in the UI
+
+- **Populate from the gateway, never from a hardcoded list.** `GET /v1/models` (authenticated)
+  returns the catalog; `GET /v1/models/query` gives a filtered shortlist;
+  `GET /v1/models/health` reports per-model health and `retry_after`; `/v1/auto-combo/{channel}/candidates`
+  exposes an `auto/*` channel's live pool. (The OpenAPI spec lists these under `/api/v1/…`; the
+  client-facing form is `/v1/….` The project releases very frequently — build against the spec,
+  and feature-detect rather than assuming a path exists.)
+- **Free-tier catalogs churn weekly.** Show presets first — `auto`, `auto/fast`, `auto/cheap`,
+  `auto/offline` — then a searchable list, then an optional pinned **chain** (ordered, max 3).
+  A user who pins `gc/gemini-3-flash` should see a clear "unavailable — using auto" fallback
+  rather than a broken notebook.
+- **Display the truth about who answered.** Every response carries an `X-OmniRoute-Decision`
+  header naming the strategy, provider and latency that served it. Render it as
+  `served by gc/gemini-3-flash · 2.8 s` under the answer, and store it on the message.
+- Keep a **global default backend** and a **per-notebook override**; show the effective one in
+  the chat box next to the model tier.
+
+### 10.5 Failures, quotas, and the fallback rule
+
+- **Rate limits:** honour `429` + `Retry-After`. The gateway already does circuit breaking,
+  key cooldown and model lockout, so our client retries **at most once**, then falls back.
+  Fighting a quota with retries burns the day's allowance for nothing.
+- **Fallback only *before* the first token.** Switching models mid-stream would splice two
+  models' text into one answer whose citations no longer match — worse than failing. If the
+  stream dies mid-answer: keep the partial text, mark the message **incomplete**, offer retry.
+  Correctness beats completion.
+- **Quota guard:** count requests and tokens per model per day locally; warn at 80%, stop and
+  fall back at 100%. A local counter is honest because `X-OmniRoute-*` telemetry gives real
+  numbers per response, and the gateway's quota states (`healthy`, `approaching_limit`,
+  `exhausted`, `unavailable`, `unknown`) are worth surfacing instead of inventing our own.
+- **Cache repeats:** hash `(question + retrieved chunk ids + backend)`. Repeat questions cost
+  zero quota — which matters on free tiers and is trivially cheap to add.
+- **Gateway down / offline:** automatic local fallback with one line of UI
+  ("Cloud unavailable — answered locally"). Never a modal, never a stall.
+
+### 10.6 Embeddings stay local. This one is non-negotiable.
+
+OmniRoute does expose `/v1/embeddings` (with a `dimensions` parameter). Do not use it for this
+app's index:
+
+1. **Index stability.** The index is pinned to 768-dim `nomic-embed-text`. Switching providers
+   means re-embedding every chunk, and mixing spaces silently ruins retrieval.
+2. **Exposure.** Embedding a document sends *all* of its text, not the 3–6 chunks a question
+   needs — orders of magnitude more data for a marginal quality gain.
+3. **Latency.** Local embedding is ~2 ms/chunk and free. There is nothing to win.
+
+Treat a cloud embedding model as a future experiment that requires an explicit full re-index,
+never a dropdown.
+
+### 10.7 Per-backend retrieval profile
+
+Prefill is nearly free on a remote model, so when a cloud backend answers, **buy quality with
+context** instead of rationing it:
+
+| Backend / tier | Chunks | Answer cap | Context sent |
+|---|---|---|---|
+| Local quick (1.7B) | 2 | 100 words | ~0.9k tokens |
+| Local snappy (4B) | 3 | 120 words | ~1.3k tokens |
+| Cloud (OmniRoute) | **6** | **250 words** | ~2.6k tokens |
+
+So retrieval parameters belong to a **backend profile**, not to one global config. The same
+question asked locally and escalated to the cloud will legitimately retrieve more chunks — and
+that is a feature, not an inconsistency.
+
+### 10.8 Setup on this machine
+
+```powershell
+# 1) Gateway (Node LTS required). Runs as a local web app on :20128.
+npm i -g omniroute
+omniroute                      # dashboard: http://localhost:20128
+
+# 2) Dashboard → API Keys → mint a key scoped to CHAT ONLY. Copy it once.
+
+# 3) Dashboard → Providers → connect one or two free providers.
+#    Zero-config default: leave it alone and use model "auto".
+
+# 4) Smoke test
+curl.exe http://localhost:20128/v1/models -H "Authorization: Bearer YOUR_KEY"
+curl.exe http://localhost:20128/v1/chat/completions -H "Authorization: Bearer YOUR_KEY" `
+  -H "Content-Type: application/json" `
+  -d '{\"model\":\"auto\",\"messages\":[{\"role\":\"user\",\"content\":\"Say ok\"}]}'
+```
+
+- **Cost on this laptop:** the gateway is a Node process, roughly 150–300 MB RSS. Fine on 12 GB,
+  but it is one more thing competing with Ollama — the app should show its footprint and offer
+  "stop gateway when answering locally". Start it on demand, not at boot.
+- **Alternatives:** run OmniRoute on another machine on the LAN and point `base_url` at it (better
+  for RAM, same privacy story), or use the vendor's hosted gateway — in which case say clearly in
+  the UI that a third party is in the request path.
+- **Key storage:** Windows Credential Manager (or DPAPI-encrypted blob), **never** in
+  `notebook.db`, never in `app.log`, never in the audit CSV. Scope the key to chat so a leaked key
+  cannot reconfigure the gateway.
+- **Never block startup on it.** Detect `127.0.0.1:20128` at launch; if absent, show
+  "Gateway not running — free models disabled" with the command above and move on.
+
+### 10.9 Trust features — build these or don't ship the toggle
+
+- **Attribution badge on every message:** `local · qwen3:4b` or `free cloud · served by X · 2.8 s`.
+- **Egress audit log** (table + UI + CSV export): timestamp, backend, model, decision header,
+  prompt tokens, output tokens, chunks sent, redactions applied. This is what makes an
+  opt-in cloud feature defensible.
+- **Payload preview:** before the first cloud call in a notebook, one click shows the exact
+  JSON that will be sent. Expectation-setting, and it catches accidental title leakage.
+- **No hidden calls.** Ingestion, digests, artefacts and retrieval honour the same policy. A
+  notebook set to `local_only` must produce zero outbound inference requests — enforce it with a
+  test that swaps in a transport which raises on any connection (§10.11).
+- **Don't let the gateway rewrite your sources.** OmniRoute advertises prompt compression
+  (15–95% token savings). Verbatim quotes and citation offsets are the product's core promise, so
+  disable compression for source text where request-level overrides exist; if you can't, verify
+  quotes against the local chunk and flag any answer whose quotation does not match exactly.
+
+### 10.10 Caveats to put in the README, not just in your head
+
+| Caveat | Reality |
+|---|---|
+| Data use | Free tiers often train on or retain prompts. Per-provider, not uniform. |
+| Durability | Unofficial/derived free backends can vanish overnight; scraped AccessTokens breach ToS. |
+| Churn | Model IDs and free quotas change weekly — never hardcode them in docs or tests. |
+| Quotas | "Free" means rate-limited and daily-capped, not unlimited. |
+| Latency variance | p95 can be 5–10× p50 when a provider is under load; the gateway's fallback masks it but adds latency. |
+| Jurisdiction | Prompts may be processed outside your country. Say so. |
+| Guarantees | No SLA, no support, no reproducibility — pin `auto/*` behaviour, not model snapshots, and accept drift. |
+
+### 10.11 Evaluation across backends
+
+Run the §14 golden set twice — `local_only` and `cloud_allowed` — and report the delta:
+
+- citation validity and faithfulness (does the cloud model cite as reliably when the context is
+  three chunks from *your* documents?),
+- first-token and full-answer latency,
+- share of questions where the cloud answer is judged better by a human on your own docs.
+
+**If the cloud does not beat the 4B by a clear margin on your corpus, don't ship the toggle.**
+That is a real possible outcome for narrow, jargon-heavy document sets, and the measurement is
+the only way to know. Add the **no-egress test** either way: in `local_only`, any attempted
+socket to a non-localhost address fails the suite.
+
+**Effort:** 2–3 evenings on top of M3 — provider abstraction, settings + audit UI, quota/fallback
+logic, and the two eval runs.
+
+---
+
+## 11. UI
 
 Three panes, keyboard-first, no build step (vendored htmx + Tailwind CSS + ~400 lines of
 vanilla JS). React is fine if you prefer it — but a Vite dev server is one more process on a
@@ -704,8 +995,9 @@ machine where every 300 MB counts; ship a prebuilt bundle if you go that route.
 │   ⏳ embedding 62%    │  A: Revenue rose 12% [S1]    │ ▸ Mind map      [generate]    │
 │ ● interview.md        │     Churn fell to 3.1% [S2]  │ ───────────────────────────── │
 │                       │     ⚠ 1 sentence unverified  │ Notes                         │
-│ 🔍 Search sources     │     [Save as note] [Copy]    │ + New note                    │
-│                       │  [Ask… ]  Quick 1.7B · 4B    │                               │
+│ 🔍 Search sources     │  local · qwen3:4b · 47 s     │ + New note                    │
+│                       │  [Save as note] [Copy]       │                               │
+│                       │  [Ask… ] Local 4B · Cloud ▾  │                               │
 └───────────────────────┴──────────────────────────────┴───────────────────────────────┘
 ```
 
@@ -720,13 +1012,20 @@ Rules that matter on slow hardware:
 - **Never block the whole UI** on a job; the app is usable during ingestion.
 - Empty states teach the tier honestly: "Quick ≈ 25 s · 4B ≈ 50 s on this machine. Narrower
   questions are faster because less context gets read."
+- **Backend selector next to the model tier** (`Local 4B · Cloud ▾`), and an **attribution line**
+  under every answer: `local · qwen3:4b · 47 s` or `free cloud · served by gc/gemini-3-flash ·
+  2.8 s`. In `escalate_on_demand` this is where the **"Better answer (free cloud)"** button sits —
+  directly under the answer it would replace.
+- **Egress is legible at a glance:** a small lock icon for `local_only`, an outlined cloud icon
+  for policies that can send data, and a one-time confirmation before a notebook's first outbound
+  call showing exactly what will be transmitted (§10.9).
 - The tier toggle belongs **in the chat box**, not buried in settings — it is the primary
   latency control and users should be able to trade speed for depth per question.
 - Offline fonts, no CDN, no analytics, no telemetry.
 
 ---
 
-## 11. API surface
+## 12. API surface
 
 | Method & path | Purpose |
 |---|---|
@@ -741,7 +1040,13 @@ Rules that matter on slow hardware:
 | `GET/POST/PATCH /api/notes` | Notes CRUD, save-from-message |
 | `POST /api/notebooks/{id}/artifacts`, `GET /api/artifacts/{id}` | Generate / fetch studio outputs |
 | `GET /api/health` | Ollama reachable, models present, loaded model, tok/s |
-| `GET/PUT /api/settings` | Model, context, threads, strict mode |
+| `GET/PUT /api/settings` | Model, context, threads, strict mode, egress defaults |
+| `GET/PUT /api/notebooks/{id}/egress` | Per-notebook policy: `local_only` / `escalate_on_demand` / `cloud_allowed` |
+| `GET /api/providers`, `POST /api/providers/{id}/test` | Backend status; gateway reachability, key validity, latency |
+| `GET /api/providers/omniroute/models` | Proxy of `GET /v1/models` + `/v1/models/health`, grouped, free-first |
+| `POST /api/chat/preview` | The exact payload egress would send, for the confirmation dialog |
+| `GET /api/egress?notebook_id=&format=csv` | Audit log read/export (§10.9) |
+| `DELETE /api/providers/{id}/key` | Forget the stored gateway key |
 
 SSE event shape:
 
@@ -750,12 +1055,17 @@ event: stage      data: {"stage":"retrieve","detail":"6 passages"}
 event: token      data: {"t":"Revenue rose 12% "}
 event: citations  data: [{"sid":"S1","source_id":"...","page":12,"chunk_id":881,"verified":true}]
 event: warning    data: {"unsupported":1}
-event: done       data: {"tokens_out":184,"ms":38210,"tok_s":4.8}
+event: done       data: {"tokens_out":184,"ms":38210,"tok_s":4.8,
+                        "backend":"omniroute","served_by":"gc/gemini-3-flash","complete":true}
+event: blocked    data: {"reason":"egress_policy","policy":"local_only"}
 ```
+
+`backend`/`served_by` on `done` is what the attribution line renders; `blocked` is what the UI
+shows when the guard fires instead of a generic error.
 
 ---
 
-## 12. Milestones
+## 13. Milestones
 
 Assumes one developer, part-time evenings/weekends. "Done" means demoable, not merged.
 
@@ -765,14 +1075,16 @@ Assumes one developer, part-time evenings/weekends. "Done" means demoable, not m
 | M1 | **Vertical slice** | Schema, upload PDF/TXT, extract, chunk, embed, FTS+vector retrieve, grounded chat with citations (CLI or minimal UI) | Ask 3 questions about a 20-page PDF; every answer cites a real page | 3–5 evenings |
 | M2 | **Usable app** | Job queue + progress + resume, 3-pane UI, streaming + stop, in-chat tier toggle, citation drawer with highlight, notes, settings/health | Ingest 5 sources while chatting; kill the app mid-ingest and it resumes | 3–5 evenings |
 | M3 | **Digests & studio** | Per-source summaries/topics/questions, notebook brief, FAQ/study guide/timeline/mind map, export to Markdown | One click produces a useful study guide with valid citations | 3–4 evenings |
-| M4 | **Hardening** | Golden-set eval, refusal threshold, optional rerank, OCR, packaging (`run.bat`/`run.sh`), backups | Fresh machine → install → ask a question in <10 min | 3–5 evenings |
-| M5 | **Audio (optional)** | Piper narration of an existing summary; optional two-voice script | 3-minute audio overview generated in <2 min of CPU | 2–3 evenings |
+| M4 | **Optional free cloud (§10)** | `ChatBackend` interface, OpenAI-compatible client, egress guard + policies, model picker from `/v1/models`, attribution + audit log, quota/fallback rules | A question answered by a free cloud model with a working "served by" badge and an audit row — and zero outbound calls when the notebook is `local_only` | 2–3 evenings |
+| M5 | **Hardening** | Golden-set eval (both backends), refusal threshold, optional rerank, OCR, packaging (`run.bat`/`run.sh`), backups | Fresh machine → install → ask a question in <10 min | 3–5 evenings |
+| M6 | **Audio (optional)** | Piper narration of an existing summary; optional two-voice script | 3-minute audio overview generated in <2 min of CPU | 2–3 evenings |
 
-Total for v1 (M0–M3): roughly **10–15 evenings**.
+Total for v1 (M0–M3): roughly **10–15 evenings**; with the optional cloud backend (M4) add
+**2–3 evenings**.
 
 ---
 
-## 13. Evaluation (don't skip this)
+## 14. Evaluation (don't skip this)
 
 Small local models fail in boring, repeatable ways. A 20-question golden set per notebook
 catches regressions when you change models, prompts, or chunk size.
@@ -788,6 +1100,10 @@ catches regressions when you change models, prompts, or chunk size.
 - **Throughput drift:** `tok/s` at minute 1 vs minute 10 of a long job. >30% drop = thermal
   throttling on this 15 W chip, and it is a hardware fact to design around, not a bug to chase.
 - **Ingestion:** minutes per 100 pages, failure rate by file type.
+- **Cross-backend delta (§10.11):** run the same set in `local_only` and `cloud_allowed`; compare
+  citation validity, faithfulness and latency. Ship the cloud toggle only if the delta justifies it.
+- **No-egress assertion:** in `local_only`, every non-localhost socket raises in tests. A failing
+  suite here is a privacy incident, not a bug.
 - **Peak commit:** peak `ollama ps` size + system commit during a session. If it approaches
   11 GB, the quality tier is being misused. This metric has no analogue on a desktop and is the
   one most likely to explain "it got slow after an hour".
@@ -798,7 +1114,7 @@ change; a "better" model that doubles latency may be the wrong trade on this mac
 
 ---
 
-## 14. Risks and mitigations
+## 15. Risks and mitigations
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
@@ -817,11 +1133,17 @@ change; a "better" model that doubles latency may be the wrong trade on this mac
 | OneDrive-redirected Documents corrupts the SQLite DB | Medium | Default `data/` to `%LOCALAPPDATA%\TimNotebook`; detect and warn if the path contains `OneDrive` |
 | Defender real-time scanning doubles ingest and load times | High | Folder exclusions for the model dir and `data/` (§9.5 step 3) |
 | Windows sleep interrupts ingestion | Medium | Resumable stage-level jobs (§7); optional timeout bump while working |
+| Fluent wrong answers feel authoritative and users stop checking citations | Medium | Keep citation verification on cloud answers too; never let the attribution line imply human review |
+| Free cloud provider trains on submitted documents | **High** | Off by default; per-notebook policy; explicit first-call confirmation; payload preview; README caveats (§10.10) |
+| Sensitive filename leaks in a prompt | Medium | Neutral source labels in cloud mode (`[S1] (p.12)`), optional redaction pass, payload preview (§10.2) |
+| Gateway key leaks into logs, SQLite or a backup | Medium | Credential-Manager/DPAPI storage, chat-only key scope, log scrubbing test, `key_ref` never the key |
+| A free model disappears or a quota runs out mid-session | **High** | Never hardcode model IDs; `auto/*` presets + pinned chain; quota guard; fall back to local before first token (§10.5) |
+| Free-tier ToS violation (unofficial OAuth bridges) | Medium | Prefer documented API-key tiers; state the risk in the README; never ship a scraped-token default |
 | Model licensing surprises | Low | Prefer Apache-2.0 (Qwen) / MIT-family; check Gemma and Llama terms before redistribution |
 
 ---
 
-## 15. Open decisions for you
+## 16. Open decisions for you
 
 1. ~~**Hardware / OS:**~~ **Answered:** Windows 11, 12 GB RAM, 512 GB SSD, 4-core 10th-gen
    Intel, no dGPU → see §2.1–2.2. The plan is now tuned to it.
@@ -836,6 +1158,13 @@ change; a "better" model that doubles latency may be the wrong trade on this mac
    the 4B model writing a good two-voice script is the slow part.
 7. **Isolation:** localhost only, or reachable from a phone on the LAN (which changes the auth
    story completely, and needs a firewall rule on Windows).
+8. **Egress default (§10):** is `local_only` (safest, slowest) or `escalate_on_demand` (local by
+   default with a one-click cloud retry) the right default for *your* documents? The plan assumes
+   `local_only`; if your corpus is entirely public material, `escalate_on_demand` is a better
+   product.
+9. **Gateway hosting (§10.8):** run OmniRoute on this laptop (simplest, ~200 MB RAM), on another
+   machine on the LAN (better for RAM), or use the vendor's hosted endpoint (a third party in the
+   request path)? Each changes what "private" means in the README.
 
 ---
 
@@ -870,6 +1199,18 @@ python -m timnb            # http://127.0.0.1:8765, opens the browser
 
 Note the data directory default: `%LOCALAPPDATA%\TimNotebook\data` — **not** Documents or
 Desktop, which are usually OneDrive-redirected (§9.5 step 4).
+
+**Optional — free cloud models (§10).** Skip entirely if the app is to stay offline.
+
+```powershell
+npm i -g omniroute            # requires Node LTS
+omniroute                     # dashboard + API on http://localhost:20128
+# Dashboard → API Keys → mint a key scoped to CHAT ONLY, then paste it into the app's settings
+curl.exe http://localhost:20128/v1/models -H "Authorization: Bearer YOUR_KEY"
+```
+
+The app should start fine without it, showing "free models unavailable" and never retrying in a
+loop.
 
 ## Appendix B — Model bake-off script
 
@@ -951,6 +1292,18 @@ Defaults chosen for this machine. The bake-off (§Appendix B) overwrites the num
   "default_tier": "snappy",
   "quick_tier_for": ["lookup", "definition", "single_source"],
   "artifact_tier": "snappy",
+  "providers": {
+    "ollama":    {"kind": "ollama",        "base_url": "http://127.0.0.1:11434", "enabled": true},
+    "omniroute": {"kind": "openai_compat", "base_url": "http://127.0.0.1:20128/v1",
+                  "key_ref": "credential://TimNotebook/omniroute", "enabled": false}
+  },
+  "egress": {
+    "default_policy": "local_only",
+    "send_source_titles": false,
+    "redaction": {"enabled": false, "mask": ["email", "phone", "long_digits"]},
+    "cloud_profile": {"chunks": 6, "max_words": 250},
+    "request_budget_per_day": 200
+  },
   "embed_model": "nomic-embed-text",
   "num_thread": 4,
   "num_batch": 128,
@@ -977,7 +1330,8 @@ Tim_doc-Extractor/
 ├── timnb/
 │   ├── __main__.py          # uvicorn + open browser
 │   ├── api/                 # notebooks, sources, chat, jobs, notes, search, settings
-│   ├── core/               # config, db, migrations, ollama client, inference gate
+│   ├── core/               # config, db, migrations, inference gate
+│   ├── backends/           # ollama.py, openai_compat.py (OmniRoute), egress guard, quota
 │   ├── ingest/             # extract, chunk, embed, queue
 │   ├── rag/                # retrieve, prompt, citations, verify
 │   └── web/                # index.html, app.js, styles.css, vendor/
@@ -993,6 +1347,11 @@ On this Windows 11 machine with only Ollama installed: add five mixed sources, w
 ask ten questions, get answers in under 90 s each with valid clickable citations, save two
 notes, export the notebook to Markdown, restart the app and resume a half-finished
 ingestion — all with the network cable unplugged.
+
+Then, separately, with the cable plugged in and OmniRoute running: set one public notebook to
+`escalate_on_demand`, press **"Better answer (free cloud)"**, see the attribution badge name the
+provider that served it and the matching row in the egress log — then flip the notebook back to
+`local_only` and confirm the zero-egress test still passes.
 
 ## Appendix F — Day-one checklist for this laptop (~45 minutes, before writing code)
 
