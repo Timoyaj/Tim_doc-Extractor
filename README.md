@@ -11,30 +11,38 @@ them, and get answers with clickable citations — powered by a local model thro
 ## The short version
 
 - One Python process, one SQLite file, one browser tab. No Docker, no Postgres, no cloud.
-- Tuned for the target box: **12 GB RAM, 512 GB SSD, no GPU**. Chat runs on `qwen3:4b`
-  ("snappy"), background artifacts on `qwen3:8b` ("quality"), embeddings on
-  `nomic-embed-text`. See [PLAN.md §2.1](PLAN.md#21-hardware-profile-12-gb-ram--512-gb-ssd).
+- Tuned for the actual target box: **Windows 11, 12 GB RAM, 512 GB SSD, 4-core 10th-gen
+  Intel, no discrete GPU.** Two tiers instead of one: `qwen3:1.7b` for quick answers (~25 s),
+  `qwen3:4b` for real questions and digests (~50 s), `nomic-embed-text` for embeddings. The
+  8B model is deliberately *not* a default — see
+  [PLAN.md §2.1–2.2](PLAN.md#21-hardware-profile-windows-11--12-gb--512-gb-ssd--4-core-10th-gen-intel).
 - Hybrid keyword + vector retrieval, strict citation checking, and a single-inference gate so
   the CPU is never split between jobs.
 - Honest UX for 30–60 second answers: stage indicators, token streaming, a working stop button.
 
 ## Quick start (once v1 exists)
 
-```bash
-ollama pull qwen3:4b            # interactive chat (~2.6 GB)
+```powershell
 ollama pull nomic-embed-text    # embeddings (~275 MB)
-ollama pull qwen3:8b            # optional: quality tier for digests/artifacts (~5.2 GB)
+ollama pull qwen3:1.7b          # quick answers (~1.4 GB)
+ollama pull qwen3:4b            # real questions (~2.6 GB)
+
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+pip install fastapi uvicorn pymupdf4llm markitdown trafilatura sqlite-vec psutil httpx
 python -m timnb                 # http://127.0.0.1:8765
 ```
 
-Expect ~20 s to first token and ~40 s for a full answer on the snappy tier; the 8B tier is
-roughly 2× slower and is used only for work you are not waiting on.
+First read [PLAN.md §9.5](PLAN.md#95-windows-11-specifics-do-these-once-in-this-order) — four
+Windows-specific steps (env vars, tray restart, Defender exclusions, keeping the database out
+of OneDrive) that save hours. Tune the defaults with the
+[day-one checklist](PLAN.md#appendix-f--day-one-checklist-for-this-laptop-45-minutes-before-writing-code).
 
 ## Roadmap
 
 | Milestone | Scope |
 |---|---|
-| M0 | Model bake-off on your actual hardware (12 GB profile) |
+| M0 | Day-one setup + bake-off on your actual laptop (Appendix F) |
 | M1 | Vertical slice: upload → chunk → retrieve → grounded answer |
 | M2 | Usable app: queue, UI, streaming, citation drawer, notes |
 | M3 | Digests and studio artifacts (FAQ, study guide, timeline, mind map) |
