@@ -32,7 +32,8 @@ with **Ollama** as the only inference backend.
   question are sent; the index, titles, notes and history stay local (§10.1, §10.6).
 - **Notes are files, not hostages (§11).** One click writes a note into your Obsidian vault as
   plain Markdown with YAML frontmatter and working wikilinks — vault auto-detected, atomic write,
-  and an edit you made in Obsidian is never silently overwritten.
+  and an edit you made in Obsidian is never silently overwritten. The vault **syncs**, so notes
+  reach your phone; that also means exported notes are as private as your sync provider (§11.5).
 - **Build vs. adopt:** two mature open-source NotebookLM clones already exist. Use them for
   a demo, but **build the lean core** — the existing stacks carry Docker + a database server
   + a generic multi-provider layer you don't need, and none of them are tuned for
@@ -372,7 +373,7 @@ CREATE TABLE artifacts (
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 -- §11: export bookkeeping so re-export is idempotent and never clobbers user edits.
--- Full definition in §11.5.
+-- Full definition in §11.6.
 -- CREATE TABLE obsidian_exports (note_id, kind, vault_path, rel_path, content_hash, exported_at);
 
 -- §10: optional cloud backend. Keys are NOT stored here — only a reference (§10.8.4).
@@ -787,7 +788,8 @@ Do not bury this in settings. Write it in the UI, in the README, and in the app'
 - **Exposure is bounded by design.** Only the 3–6 chunks retrieved for one question are sent
   (~1.3–2.6k tokens). The library, embeddings, titles, notes, chat history and the audit log stay
   local. Retrieval always runs on the local index, so cloud models can never "see" a document
-  that retrieval did not select.
+  that retrieval did not select. (A note you *export* to a synced vault leaves by a different
+  route — your sync client, not the model. §11.5 covers it, and the two are never conflated.)
 - **Free tiers are not private.** Many train on submitted data or retain prompts for abuse
   review; terms vary per provider and change without notice. Some "free forever" backends are
   unofficial OAuth bridges that may break nightly — or violate the upstream provider's terms.
@@ -1181,6 +1183,9 @@ notes are yours forever, readable by any editor, syncable by whatever you alread
 
 No plugin required. No Obsidian running required. Nothing to install.
 
+**Default target:** the vault Obsidian currently has open, subfolder `Tim Notebook/`. That vault
+syncs to your other devices, which is the point — and it is also why §11.5 exists.
+
 ```
    App (SQLite)                         Obsidian vault (plain files)
    ─────────────                        ────────────────────────────
@@ -1196,7 +1201,7 @@ No plugin required. No Obsidian running required. Nothing to install.
 
 | Action | Where it goes | When |
 |---|---|---|
-| **Send to Obsidian** (per note / per answer) | `<vault>/<subfolder>/<Notebook>/` | The primary path. One click from the note editor and from any chat answer |
+| **Send to Obsidian** (per note / per answer) | `<vault>/<subfolder>/<Notebook>/` | The primary path. One click from the note editor and from any chat answer. **Default vault = the open one; default subfolder = `Tim Notebook`; it syncs** (§11.5) |
 | **Bulk export notebook** | `<vault>/<subfolder>/<Notebook>/` + `_Index.md` | Backfill or re-publish after edits |
 | **Export everything** | `<vault>/<subfolder>/` (one folder per notebook) | Switch machines, stop using the app, keep the knowledge |
 
@@ -1223,7 +1228,12 @@ Obsidian keeps a registry of every vault it has opened:
   forget every vault. Parse defensively — it is minified, has no BOM, and Obsidian rewrites it
   whenever the app opens or closes.
 - **Offer every vault found**, name = folder name, with the currently open one (`"open": true`)
-  preselected. Absolute paths and emoji/unicode folder names must survive intact.
+  preselected — that is the default target, and no configuration step is needed for the common
+  case. Absolute paths and emoji/unicode folder names must survive intact.
+- **Show whether each vault syncs.** Heuristic, from the path and sibling folders: a vault under
+  OneDrive/Dropbox/Google Drive/iCloud Drive, or containing `.obsidian/sync.json` (Obsidian Sync),
+  or inside a folder with `.stfolder` (Syncthing) is marked **synced**. This is exactly the fact
+  the user needs in order to decide where sensitive notes should go (§11.5).
 - **Fallbacks, in order:** the registry → the last-used vault stored in our settings → a native
   folder picker. If Obsidian was never run, the picker is the only honest option.
 - **Validate on save, not on startup:** the folder must exist, be writable, and not be a OneDrive
@@ -1281,13 +1291,13 @@ Design rules:
   Never write in place — Obsidian may read a half-flushed file, and Windows will happily hand you
   a truncated one.
 - **Never clobber an edit made in Obsidian.** Store `content_hash` of the last export per file
-  (§11.5). On re-export:
+  (§11.6). On re-export:
   - file hash == last exported hash → the user has not touched it → **overwrite**;
   - file hash differs → **they edited it in Obsidian** → write `... (from Tim Notebook).md`
     alongside and show a one-line notice. Offer "overwrite anyway" with a diff, never silently.
 - **One-way by default.** The DB is the source of truth for notes the app created; the vault is a
   publish target. Two-way sync is a different, much harder product (what if both changed?) and is
-  a non-goal (§11.9).
+  a non-goal (§11.10).
 - **Windows filename hygiene** — sanitize before writing, because a bad filename here is a crash:
   strip `\ / : * ? " < > |` and control characters; trim trailing dots and spaces; reject the
   reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`); cap the stem
@@ -1300,9 +1310,70 @@ Design rules:
   subfolder when it is absent or unparseable.
 - **Don't fight the sync client.** A vault inside OneDrive/Dropbox/Syncthing/Obsidian Sync can
   produce "conflicted copy" files if we write while it is mid-sync. Writes are small and atomic;
-  batch export should throttle to ~10 files/second, not blast 500 at once.
+  batch export should throttle to ~10 files/second, not blast 500 at once. **This is the default
+  configuration here, not an edge case** — see §11.5 for the full set of sync rules.
 
-### 11.5 Bookkeeping in the DB
+### 11.5 Because your vault syncs (the default configuration)
+
+The default target is **the vault Obsidian currently has open**, subfolder `Tim Notebook/`, and
+that vault is synced to other devices. Two consequences follow: a good one, and one the README has
+to be honest about.
+
+**The good one.** Notes reach your phone, tablet and other machine through infrastructure you
+already pay for and already trust. That is most of the value of "notes land in your vault" — the
+note is not trapped on the laptop, and it survives the app being deleted.
+
+**The honest one.** Exporting a note into a synced vault **moves that note to your sync provider's
+cloud**. `local_only` (§10.2) governs *inference* — it means no document text is sent to an AI
+provider. It does not, and cannot, stop your own sync client from uploading a file you asked to be
+written into a synced folder. Nothing here is a leak, but it must not be described as "nothing
+leaves the machine".
+
+So the rule, stated once and then enforced in the UI:
+
+> Notes you export are as private as the vault you export them to. Inferences stay local; exported
+> notes follow your sync provider's terms.
+
+Practical consequences:
+
+- **Per-notebook vault target**, not just a global default. Sensitive notebooks can point at a
+  vault that is not synced (or is synced only with device encryption), while public research goes
+  to the synced vault. Default: synced vault, because that is what makes the feature useful.
+- **A one-line notice at first export** into a synced vault: "Notes exported here will sync to
+  <provider> like the rest of this vault." Once, not every time, and never a modal.
+- **Never put app data in the vault.** SQLite + WAL inside a sync folder is how you get
+  "database disk image is malformed" and conflicted copies of a binary file. The DB stays in
+  `%LOCALAPPDATA%\TimNotebook` (§9.5 step 4); only rendered `.md` files go into the vault.
+- **Sources are not copied into the vault by default.** A PDF sitting in the vault syncs too, at
+  full size. If a source note should carry the original, say so explicitly with an attachment
+  option — do not do it silently.
+
+#### Writing into a vault that a sync client is watching
+
+| Concern | What the app does |
+|---|---|
+| **OneDrive Files On-Demand placeholders.** On Windows 11, `Documents` and `Desktop` are often OneDrive-redirected, and files may be cloud-only stubs | Check the write target's attributes before the first write — `os.stat(p).st_file_attributes & 0x400000` (`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`; Windows-only, skip elsewhere). If set, warn: "this folder is cloud-only — writing will force a download", and suggest *Always keep on this device* for the subfolder. Also check that the *parent* path exists before assuming success |
+| **Sync storms on a 15 W laptop** | A 500-note bulk export makes OneDrive/Dropbox spin CPU and disk exactly while Ollama needs both. Throttle bulk export to ~10 files/second with a 100–150 ms gap, in batches of 25 with a short pause; never run a bulk export during an active answer (§9.3) |
+| **Transient temp files getting uploaded** | Write `<name>.md.tmp` in the same directory, `fsync`, then `os.replace()` immediately — the window is sub-millisecond and same-volume rename is atomic. On failure, delete the temp in a `finally` block so a crashed export cannot leave junk that syncs forever |
+| **Conflict copies** | Two writers can still collide (you edit on your phone while a re-export lands). The `content_hash` check (§11.4) covers the common case; in addition, detect sibling artefacts — `name (1).md`, `name (conflicted copy).md`, `name.sync-conflict-*.md` — and show them once in the export log rather than silently ignoring them |
+| **Half-synced state** | Never read the vault to decide what to export. The DB is the source of truth, the vault is a destination (§11.10). A vault that is still downloading must not look like "the user deleted their notes" |
+| **Long paths** | Synced vaults often live deep in a user profile. The ~250-char budget in §11.4 matters more here, not less |
+
+#### Verification that this actually worked
+
+"Local folder write succeeded" is not the test — especially when a sync client sits between the
+file and the device you care about. The M3 acceptance criterion is therefore:
+
+1. Export a note in the app.
+2. Read it in Obsidian on this machine (frontmatter parses, wikilinks resolve).
+3. Wait for sync, open Obsidian on a phone or second device, find the note with its links intact.
+4. Edit it there, re-export in the app, and confirm you get a **sibling file**, not a silent
+   overwrite of your edit.
+
+That sequence is what "the vault syncs" buys, and it is the only honest definition of done for
+this feature.
+
+### 11.6 Bookkeeping in the DB
 
 ```sql
 CREATE TABLE obsidian_exports (
@@ -1319,7 +1390,7 @@ CREATE TABLE obsidian_exports (
 Two useful consequences: the UI can show **"in vault ✓"** on an exported note, and re-export
 becomes a no-op when content and file are unchanged.
 
-### 11.6 Opening it in Obsidian
+### 11.7 Opening it in Obsidian
 
 After a write, offer a **"Open in Obsidian"** link:
 
@@ -1336,18 +1407,19 @@ but the whole URI travels as a command line on Windows (~2k practical limit) —
 truncated silently. Write the file, then open it by path. The URI is a convenience, never the
 delivery mechanism.
 
-### 11.7 UI
+### 11.8 UI
 
 - Note editor: a split **"Send to Obsidian"** button (vault picker + folder in a dropdown), with
   the state shown as `Saved to vault · 09:14` once written.
 - Every chat answer keeps **[Save as note] [Copy]**, plus **`Send to Obsidian`** in the same row —
   saving and exporting should not be two mental steps.
-- Settings → Obsidian: detected vaults, subfolder (`Tim Notebook`), filename pattern, template
-  path, "export source notes" toggle, "open after export" toggle, and a **Test write** button
-  that creates and deletes a probe file.
+- Settings → Obsidian: detected vaults (each marked **synced** or **local**), subfolder
+  (`Tim Notebook`), filename pattern, template path, "export source notes" toggle, "open after
+  export" toggle, and a **Test write** button that creates and deletes a probe file — and reports
+  the placeholder/attribute check from §11.5 rather than just "ok".
 - Bulk export runs as a normal job (§9.3) with progress, so it can't wedge the CPU or the UI.
 
-### 11.8 Failure modes
+### 11.9 Failure modes
 
 | Symptom | Cause | Behaviour |
 |---|---|---|
@@ -1356,9 +1428,11 @@ delivery mechanism.
 | Filename collision with an unrelated note | Same title, different notebook | Append a short `tim_id` suffix; never overwrite a file we have no export record for |
 | Duplicate notes after a re-export | `tim_id` lost (user deleted frontmatter) | Treat as a new file; note it in the log rather than guessing |
 | Obsidian not installed | Registry missing | Hide the button; show "Obsidian not detected — use Export as Markdown" (the same renderer, to a folder) |
-| Vault is a OneDrive placeholder | Files-on-demand | Warn before first write; writing forces a download and can stall |
+| Vault is a OneDrive placeholder | Files-on-demand | Detect via `0x400000` attribute, warn before first write; writing forces a download and can stall |
+| Note does not appear on the phone | Sync client paused, signed out, or selective sync excludes the folder | Say "written to the vault (sync handled by <provider>)" instead of implying delivery; point at the provider's status, not at our logs |
+| A `conflicted copy` file appears next to a note | Edited on another device while a re-export landed | Log it once with both paths; never auto-merge, never delete either copy |
 
-### 11.9 Non-goals (write these down before someone asks)
+### 11.10 Non-goals (write these down before someone asks)
 
 - **Two-way sync / watching the vault for edits.** Attractive and genuinely useful — but it needs
   change tracking, conflict policy and a merge story. v1 exports; v2 may *import* (treat a vault
@@ -1368,10 +1442,10 @@ delivery mechanism.
 - **Writing into `.obsidian/`, installing plugins, or creating Dataview queries on the user's
   behalf.** Suggest them in docs; do not touch them.
 
-### 11.10 Effort and evaluation
+### 11.11 Effort and evaluation
 
 **~1 evening** on top of M3: a renderer (frontmatter + body), filename sanitizer, atomic writer,
-export table, vault discovery, one button, and the five failure cases in §11.8.
+export table, vault discovery, one button, and the five failure cases in §11.9.
 
 Test it like the rest: render golden notes → write into a **temporary vault** → assert frontmatter
 parses as YAML, wikilinks resolve to created source notes, a second export is a no-op, an
@@ -1410,7 +1484,7 @@ Rules that matter on slow hardware:
   and shows the chunk's heading — the single feature that makes answers trustworthy.
 - **`Send to Obsidian` sits next to `[Save as note] [Copy]`** on every answer, and in the note
   editor next to the vault name. After a successful write it becomes `In vault · 09:14 — Open`,
-  where *Open* is an `obsidian://open?path=` link (§11.6).
+  where *Open* is an `obsidian://open?path=` link (§11.7).
 - **Never block the whole UI** on a job; the app is usable during ingestion.
 - Empty states teach the tier honestly: "Quick ≈ 25 s · 4B ≈ 50 s on this machine. Narrower
   questions are faster because less context gets read."
@@ -1492,7 +1566,7 @@ Assumes one developer, part-time evenings/weekends. "Done" means demoable, not m
 | M0 | **Day-one setup + bake-off** (Appendix F) | Env vars, tray restart, Defender exclusions, pull 3 models, measure tok/s/prefill/commit on mains and battery | Appendix F table filled; tier, chunk count and word cap chosen | 1 evening |
 | M1 | **Vertical slice** | Schema, upload PDF/TXT, extract, chunk, embed, FTS+vector retrieve, grounded chat with citations (CLI or minimal UI) | Ask 3 questions about a 20-page PDF; every answer cites a real page | 3–5 evenings |
 | M2 | **Usable app** | Job queue + progress + resume, 3-pane UI, streaming + stop, in-chat tier toggle, citation drawer with highlight, notes, settings/health | Ingest 5 sources while chatting; kill the app mid-ingest and it resumes | 3–5 evenings |
-| M3 | **Digests, studio & Obsidian** | Per-source summaries/topics/questions, notebook brief, FAQ/study guide/timeline/mind map, Markdown export, **Obsidian vault export** (frontmatter, wikilinks, atomic writes, idempotent re-export) | One click produces a study guide with valid citations; **"Send to Obsidian" appears in the vault within a second, links resolve, and an edit made in Obsidian survives the next export** | 4–5 evenings |
+| M3 | **Digests, studio & Obsidian** | Per-source summaries/topics/questions, notebook brief, FAQ/study guide/timeline/mind map, Markdown export, **Obsidian vault export** (frontmatter, wikilinks, atomic writes, idempotent re-export, sync-aware writes) | One click produces a study guide with valid citations; **a note appears in the vault within a second, links resolve, an edit made in Obsidian survives the next export, and after sync the note reads correctly on a phone** | 4–5 evenings |
 | M4 | **Optional free cloud (§10)** | `ChatBackend` interface, OpenAI-compatible client, egress guard + policies, **one-click connect** (supervisor, key minting, install-on-demand, Job Object), model picker from `/v1/models`, attribution + audit log, quota/fallback rules | Click **Connect OmniRoute** on a machine where it was never installed, and reach an answer from a free cloud model — with a working "served by" badge, an audit row, no terminal window, and no orphan process after quitting | 4–5 evenings |
 | M5 | **Hardening** | Golden-set eval (both backends), refusal threshold, optional rerank, OCR, packaging (`run.bat`/`run.sh`), backups | Fresh machine → install → ask a question in <10 min | 3–5 evenings |
 | M6 | **Audio (optional)** | Piper narration of an existing summary; optional two-voice script | 3-minute audio overview generated in <2 min of CPU | 2–3 evenings |
@@ -1522,9 +1596,12 @@ catches regressions when you change models, prompts, or chunk size.
   citation validity, faithfulness and latency. Ship the cloud toggle only if the delta justifies it.
 - **No-egress assertion:** in `local_only`, every non-localhost socket raises in tests. A failing
   suite here is a privacy incident, not a bug.
-- **Obsidian round-trip (§11.10):** render → write to a temp vault → parse the frontmatter back as
+- **Obsidian round-trip (§11.11):** render → write to a temp vault → parse the frontmatter back as
   YAML, resolve every wikilink, re-export (expect a no-op), edit the file externally (expect a
   sibling file, not a clobber), and run a hostile-title set. Then open one in Obsidian.
+- **Sync round-trip (§11.5):** the automated half is "temp file cleaned up, no placeholder write,
+  throttling honoured". The real check is manual and belongs in the release ritual: export on the
+  laptop, wait for sync, read it on a phone.
 - **Peak commit:** peak `ollama ps` size + system commit during a session. If it approaches
   11 GB, the quality tier is being misused. This metric has no analogue on a desktop and is the
   one most likely to explain "it got slow after an hour".
@@ -1570,8 +1647,11 @@ change; a "better" model that doubles latency may be the wrong trade on this mac
 | Duplicate notes accumulate on re-export | High | `tim_id` frontmatter as the join key + `obsidian_exports` table; no id join = new file, logged |
 | A bad title crashes the writer (`:` `*` `?` `\` `/` `\|`, `CON`, trailing dot) | Medium | One sanitizer applied to every filename, with tests using hostile titles; stem capped and hashed |
 | Vault on an unplugged drive / renamed folder | Medium | Validate at write time; notes stay in the DB with a "pending" count and a retry |
+| **OneDrive Files-On-Demand vault: writes hit cloud-only placeholders** (default on Win11, where Documents is often redirected) | **High** | Check `st_file_attributes & 0x400000` before the first write, warn and suggest *Always keep on this device*; never assume the parent path exists (§11.5) |
+| **Exported notes leave the machine through the sync provider** | **High** (by design, must be disclosed) | Say it in the README and at first export; per-notebook unsynced-vault override; never claim `local_only` covers exports (§11.5) |
+| Sync storm during bulk export starves inference on a 15 W CPU | Medium | Throttle to ~10 files/s with gaps, batches of 25, and never during an active answer (§11.5) |
 | Writing into a syncing vault creates conflicted copies | Medium | Small atomic writes, throttled bulk export, warn when the vault path sits under OneDrive/Dropbox |
-| Truncated note because content went through the URI | Low | Content is never sent by URI — write the file, then `obsidian://open?path=` (§11.6) |
+| Truncated note because content went through the URI | Low | Content is never sent by URI — write the file, then `obsidian://open?path=` (§11.7) |
 | Obsidian updates change the registry format | Low | Parse defensively, fall back to last-used path, then a folder picker |
 | Model licensing surprises | Low | Prefer Apache-2.0 (Qwen) / MIT-family; check Gemma and Llama terms before redistribution |
 
@@ -1599,13 +1679,21 @@ change; a "better" model that doubles latency may be the wrong trade on this mac
 9. **Gateway hosting (§10.9):** run OmniRoute on this laptop (simplest, ~200 MB RAM), on another
    machine on the LAN (better for RAM), or use the vendor's hosted endpoint (a third party in the
    request path)? Each changes what "private" means in the README.
-10. **Obsidian target (§11):** which vault, and which subfolder — `Tim Notebook/` at the vault
-   root, or mirroring your existing PARA/Zettelkasten structure? And should source digests be
-   exported as notes too, or only your own notes and saved answers? The defaults in §11.3 are a
-   starting point, not a preference.
-11. **Vault sync (§11.4):** is this vault local-only, or does it sync (OneDrive, Obsidian Sync,
-   Syncthing) to other devices? If it syncs, notes reach your phone for free — and the vault's
-   confidentiality becomes the sync provider's problem.
+10. ~~**Obsidian target (§11):**~~ **Answered: the defaults.** The open vault, subfolder
+    `Tim Notebook/`. No PARA/Zettelkasten remapping, no per-notebook structure. If you later want
+    notebooks mapped into an existing folder scheme, that becomes a per-notebook override — the
+    hook is already in the config (§Appendix C, `obsidian.subfolder`).
+11. ~~**Vault sync (§11.5):**~~ **Answered: the vault syncs.** Design consequence: the sync rules
+    in §11.5 are the *default* path, not an edge case — provider-aware warnings, throttled bulk
+    export, placeholder detection, and a definition of done that ends with "read it on another
+    device".
+12. **Which provider syncs it** (OneDrive, Dropbox, Google Drive, iCloud, Obsidian Sync,
+    Syncthing)? Only changes two things: the name shown in the first-export notice, and whether
+    Files-On-Demand/placeholder handling is needed (OneDrive on Windows 11 is the case that
+    matters). Worth 30 seconds to note in Settings.
+13. **Sensitive corpora:** if a notebook ever holds something you would not put in your sync
+    provider's cloud, point it at an unsynced vault (per-notebook override, §11.5) rather than
+    turning export off entirely.
 
 ---
 
@@ -1758,13 +1846,19 @@ Defaults chosen for this machine. The bake-off (§Appendix B) overwrites the num
   "obsidian": {
     "enabled": true,
     "vault_path": null,
+    "default_vault": "currently_open",
     "subfolder": "Tim Notebook",
     "filename_pattern": "{date} - {title}",
     "export_source_notes": true,
+    "copy_source_files": false,
     "export_artifacts": true,
     "open_after_export": false,
     "template_path": null,
-    "on_external_edit": "write_sibling"
+    "on_external_edit": "write_sibling",
+    "vault_is_synced": true,
+    "sync_throttle_ms": 120,
+    "notice_on_first_synced_export": true,
+    "per_notebook_vault_override": true
   },
   "egress": {
     "default_policy": "local_only",
@@ -1817,9 +1911,11 @@ Tim_doc-Extractor/
 
 On this Windows 11 machine with only Ollama installed: add five mixed sources, watch progress,
 ask ten questions, get answers in under 90 s each with valid clickable citations, save two
-notes, export the notebook to Markdown, **send two notes to a real Obsidian vault and read them
+notes, export the notebook to Markdown, **send two notes to your real Obsidian vault and read them
 there** (frontmatter parses, wikilinks resolve, re-export creates no duplicates), restart the app
-and resume a half-finished ingestion — all with the network cable unplugged.
+and resume a half-finished ingestion — all with the network cable unplugged. Then plug the cable
+in, wait for sync, and **read one of those notes on your phone**; the vault is the one place this
+app is allowed to be online by default (§11.5).
 
 Then, separately, with the cable plugged in and OmniRoute running: set one public notebook to
 `escalate_on_demand`, press **"Better answer (free cloud)"**, see the attribution badge name the
@@ -1846,7 +1942,7 @@ and §9.4, and they are what you tune the defaults against.
 | 11 | While generating, Resource Monitor → Commit, and `ollama ps` SIZE | ______ GB / ______ GB |
 | 12 | Time one real answer end to end, by hand, with a watch | ______ s |
 | 13 | *Optional:* click **Connect OmniRoute**, then `netstat -ano \| findstr :20128` | `127.0.0.1:20128` (never `0.0.0.0`) |
-| 14 | *Optional:* open Obsidian once, then check Settings → Obsidian lists your vault | vault: ______ |
+| 14 | *Optional:* open Obsidian once; Settings → Obsidian should list the vault, marked **synced** | vault: ______ · provider: ______ |
 
 **Then decide, and write it down in this file:**
 

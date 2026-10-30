@@ -37,10 +37,16 @@ them, and get answers with clickable citations — powered by a local model thro
 ## Local by default
 
 The app is designed to work with the network cable unplugged. Documents, chunks, embeddings,
-notes and the search index never leave the machine. Online mode is a **per-notebook policy**
+notes and the search index stay on your machine. Online mode is a **per-notebook policy**
 (`local_only` by default), and even when enabled only the 3–6 retrieved chunks for a single
 question are sent — never a whole document, never the index. Embeddings are always computed
 locally. See [PLAN.md §10.1](PLAN.md#101-the-trade-stated-plainly) for the trade in full.
+
+**One honest exception: your own sync client.** Notes you export to Obsidian land in a vault that
+syncs to your other devices — so those notes live in your sync provider's cloud, exactly like
+every other note in that vault. Inference is still local; the vault is the one online path the app
+uses by default. If a notebook's contents should not be in that cloud, point it at an unsynced
+vault ([PLAN.md §11.5](PLAN.md#115-because-your-vault-syncs-the-default-configuration)).
 
 ## Quick start (once v1 exists)
 
