@@ -364,7 +364,7 @@ CREATE TABLE artifacts (
 
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
--- §10: optional cloud backend. Keys are NOT stored here — only a reference (§10.8).
+-- §10: optional cloud backend. Keys are NOT stored here — only a reference (§10.8.4).
 CREATE TABLE providers (
   id TEXT PRIMARY KEY,                -- 'ollama' | 'omniroute'
   kind TEXT NOT NULL,                 -- 'ollama' | 'openai_compat'
@@ -782,6 +782,9 @@ Do not bury this in settings. Write it in the UI, in the README, and in the app'
   unofficial OAuth bridges that may break nightly — or violate the upstream provider's terms.
 - **Therefore it is opt-in, visible, and reversible.** Off by default. Per-notebook policy. A
   badge on every answer naming who produced it. One switch to go back to local.
+- **Local-only is enforced, not promised.** The gateway is started on demand and bound to
+  loopback (§10.8.2), and a `local_only` notebook makes zero outbound inference calls — asserted
+  by a test, not by good intentions.
 
 Tell users the honest rule: *free cloud models are fine for public papers, textbooks and
 documentation; they are not fine for medical records, contracts under NDA, or anything with
@@ -839,6 +842,9 @@ the documented OpenAI-compatible path.
 
 ### 10.4 Choosing models in the UI
 
+- **The picker is empty until connected.** Show the **Connect OmniRoute** button in place of the
+  list — never a spinner or a disabled dropdown with no explanation. After connect, models arrive
+  from `/v1/models` (§10.8).
 - **Populate from the gateway, never from a hardcoded list.** `GET /v1/models` (authenticated)
   returns the catalog; `GET /v1/models/query` gives a filtered shortlist;
   `GET /v1/models/health` reports per-model health and `retry_after`; `/v1/auto-combo/{channel}/candidates`
@@ -871,7 +877,9 @@ the documented OpenAI-compatible path.
 - **Cache repeats:** hash `(question + retrieved chunk ids + backend)`. Repeat questions cost
   zero quota — which matters on free tiers and is trivially cheap to add.
 - **Gateway down / offline:** automatic local fallback with one line of UI
-  ("Cloud unavailable — answered locally"). Never a modal, never a stall.
+  ("Cloud unavailable — answered locally"). Never a modal, never a stall. If the gateway died
+  mid-session (crash, OOM, user closed it), offer **Reconnect** — which re-runs the supervised
+  start (§10.8), and if that fails twice, stop offering and leave the notebook on local.
 
 ### 10.6 Embeddings stay local. This one is non-negotiable.
 
@@ -902,38 +910,211 @@ So retrieval parameters belong to a **backend profile**, not to one global confi
 question asked locally and escalated to the cloud will legitimately retrieve more chunks — and
 that is a feature, not an inconsistency.
 
-### 10.8 Setup on this machine
+### 10.8 One-click connect: the app starts the gateway
 
-```powershell
-# 1) Gateway (Node LTS required). Runs as a local web app on :20128.
-npm i -g omniroute
-omniroute                      # dashboard: http://localhost:20128
+A "Connect OmniRoute" button that then tells the user to open a terminal and run `npm i -g
+omniroute` is not a feature. The app owns the lifecycle: it detects an existing gateway, starts
+one if needed, mints its own API key, discovers models, and stops it again on disconnect.
 
-# 2) Dashboard → API Keys → mint a key scoped to CHAT ONLY. Copy it once.
+**Never send the user to a shell prompt unless something is genuinely missing** (Node, or
+permission to install). Everything else is a state machine with a progress line.
 
-# 3) Dashboard → Providers → connect one or two free providers.
-#    Zero-config default: leave it alone and use model "auto".
+#### 10.8.1 The connect sequence
 
-# 4) Smoke test
-curl.exe http://localhost:20128/v1/models -H "Authorization: Bearer YOUR_KEY"
-curl.exe http://localhost:20128/v1/chat/completions -H "Authorization: Bearer YOUR_KEY" `
-  -H "Content-Type: application/json" `
-  -d '{\"model\":\"auto\",\"messages\":[{\"role\":\"user\",\"content\":\"Say ok\"}]}'
+```
+[Connect OmniRoute]
+        │
+        ├─ probe 127.0.0.1:20128 /healthz ──► already running?  ──► ADOPT (never killed on disconnect)
+        │
+        ├─ resolve CLI: shutil.which("omniroute") → else `npm root -g`/node entry → else NOT_INSTALLED
+        │        └─ NOT_INSTALLED → "Install gateway (~40 MB)" → `npm i -g omniroute@<pinned>`
+        │
+        ├─ spawn `omniroute serve` (foreground, no --daemon) with our env (§10.8.2)
+        │        logs → %LOCALAPPDATA%\TimNotebook\logs\omniroute.log
+        │
+        ├─ poll /healthz with backoff, staged text: "starting… 8 s" (90 s budget)
+        │
+        ├─ GET  /api/auth/status      → is a dashboard password set?
+        ├─ POST /api/auth/login       → JWT (memory only, never written to disk)
+        ├─ POST /api/keys {label}     → full key value → Windows Credential Manager
+        ├─ GET  /v1/models            → populate the model picker
+        └─ READY  "42 free models · gateway on 127.0.0.1:20128"
 ```
 
-- **Cost on this laptop:** the gateway is a Node process, roughly 150–300 MB RSS. Fine on 12 GB,
-  but it is one more thing competing with Ollama — the app should show its footprint and offer
-  "stop gateway when answering locally". Start it on demand, not at boot.
+If any step fails, the button becomes **Retry** and the panel shows the last 20 log lines with
+tokens redacted — not an error code.
+
+#### 10.8.2 Environment we force, and why
+
+| Variable | Value | Why it matters |
+|---|---|---|
+| `PORT` | `20128` (or the next free port; the stored `base_url` follows it) | Single-port mode: dashboard + `/v1` together |
+| `OMNIROUTE_SERVER_HOST` | **`127.0.0.1`** | **The default is `0.0.0.0`.** Left alone, the dashboard — and the provider credentials behind it — are reachable from the LAN. This is the single most important line in the launch env |
+| `DATA_DIR` | `%LOCALAPPDATA%\TimNotebook\omniroute` | Keeps its SQLite out of OneDrive, separate from our data, and makes a clean reset a folder deletion |
+| `INITIAL_PASSWORD` | generated once (32 bytes), stored in Credential Manager | Only applies while no password is saved, so passing it every launch is harmless and makes key-minting possible without user input |
+| `OMNIROUTE_MEMORY_MB` | `1024` | Default heap calibration is ~35% of RAM (≈4 GB here) and would compete with Ollama |
+| `OMNIROUTE_SHOW_LOG` | `1` | Inside `serve`'s supervisor, this forwards child output to our captured stream |
+| `OMNIROUTE_HEADLESS` | **unset** | Headless disables the dashboard; provider OAuth and first-run setup need it |
+
+Do **not** pass `--daemon`: it detaches, we lose the handle, and stopping becomes guesswork about
+PID files and ports. Foreground `serve` + our own supervisor is the whole point.
+
+#### 10.8.3 Process management on Windows
+
+- **Launch `node <entry>`, not the `.cmd` shim.** `shutil.which("omniroute")` returns
+  `%APPDATA%\npm\omniroute.CMD`, which needs `cmd /c` and mangles signals and exit codes. Resolve
+  the JS entry (`npm root -g` → `node_modules\omniroute\…`) and run it under `node`.
+- **`creationflags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`**, `stdin=DEVNULL`,
+  stdout/stderr to the log file. No console window flashing on every connect.
+- **Kill the tree, not the process.** `omniroute serve` runs a supervised child
+  (`processSupervisor.mjs`), so the PID we hold is a parent. Stop with
+  `taskkill /PID <pid> /T /F` (POSIX: kill the process group).
+- **Never orphan it.** Bind the child to a Job Object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (pywin32). If our app crashes, Windows tears the gateway
+  down with it. Belt and braces: `gateway.json` `{pid, port, started_at, owned}` in the data dir,
+  checked and cleaned on next launch.
+- **Reuse, don't duplicate.** Probe the port before spawning; if a healthy gateway is already
+  there, mark `owned: false` and **adopt** it. Disconnect must never kill what we did not start.
+- **Disconnect:** graceful stop → 10 s grace → force. Only when `owned`.
+
+#### 10.8.4 Minting the key without bothering the user
+
+Because we set `INITIAL_PASSWORD` on first run, the app can authenticate and create its own
+key: `POST /api/auth/login {"password": …}` → JWT, then `POST /api/keys {"label": "tim-notebook"}`
+→ `201` with the full key value. Store it via Credential Manager under
+`TimNotebook/omniroute`, scope to chat, and use it as `Authorization: Bearer …` on `/v1` calls.
+
+Two cases where this cannot work, both handled explicitly:
+
+- **The user already ran OmniRoute manually.** Its password exists, ours is ignored, login returns
+  `401`. Do **not** try known defaults. Detect via `GET /api/auth/status`, then offer: *"An
+  existing gateway has its own dashboard password — paste an API key from Dashboard → API Keys,
+  or reset it with `omniroute reset-password`."*
+- **npm installs ship a placeholder password.** `.env.example` carries a publicly known
+  `CHANGEME` value that npm installs copy, so a once-manually-started gateway can have a
+  guessable dashboard password. Warn on detection ("change it in Dashboard → Settings →
+  Security") without ever attempting the credential ourselves.
+
+The JWT stays in memory. The minted key goes to the OS credential store, never `notebook.db`.
+
+#### 10.8.5 Install on demand — and pin the version
+
+- Detect `node --version` (20 LTS or newer) and `npm`. Missing Node → show the official download
+  link and stop. **Do not silently download and run installers.**
+- If the package is absent, offer one button: `npm i -g omniroute@<pinned>`, streamed output,
+  cancellable, no admin rights needed (user-scope global prefix). ~40 MB plus dependencies.
+- **Pin the major/minor and never auto-update.** The project ships very frequently, and it is the
+  component that holds provider credentials and mints API keys. Give an explicit
+  "Check for gateway update" action that shows the version diff before installing.
+
+#### 10.8.6 Failure matrix
+
+| Symptom | Cause | What the app does |
+|---|---|---|
+| Port 20128 answers, but not with OmniRoute's health shape | Something else owns the port | Offer port 20129 (updates `base_url`); never kill a foreign process |
+| Process exits within 2 s, `EADDRINUSE` | Port race between probe and spawn | Retry once on the next free port, then surface the log tail |
+| `healthz` never OK within 90 s | First boot is slow on 4 cores (SQLite schema, catalogs) | Keep the staged timer visible; on timeout kill the tree and show the tail |
+| `401` on `/api/keys` | Existing password, not ours | Paste-key or `reset-password` path (§10.8.4) |
+| `EBADENGINE` / `node -v` too old | Node < 20 | Actionable message + upgrade link |
+| `/v1/models` returns an empty catalog | No provider connected yet | Deep-link Dashboard → Providers; the app stays usable on the local model |
+| Connect pressed twice | Double click / two windows | Idempotent: single-flight lock, second click joins the in-flight attempt |
+| App crashed, gateway still running | No Job Object (dev build) | `gateway.json` detected on next launch → adopt, then stop when `owned` |
+
+#### 10.8.7 Shape of the code
+
+```python
+async def connect(self, *, install: bool = False) -> ConnectResult:
+    if await self._healthy():                     # adopt, never kill
+        return await self._finish(owned=False)
+
+    exe = self._resolve_entry()                   # node + JS entry, not the .cmd shim
+    if exe is None:
+        if not install:
+            return ConnectResult.need_install()
+        if not (await self._npm_install()):       # pinned version, streamed, cancellable
+            return ConnectResult.failed("install")
+
+    self._proc = subprocess.Popen(
+        exe, cwd=str(self.state_dir), stdin=subprocess.DEVNULL,
+        stdout=self._log_fh, stderr=subprocess.STDOUT,
+        env=self._env(),                          # §10.8.2 — SERVER_HOST=127.0.0.1
+        creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+    )
+    self._assign_job_object(self._proc)           # dies with us
+
+    if not await self._wait_healthy(timeout=90):  # staged progress via SSE
+        self._kill_tree()
+        return ConnectResult.failed("startup", tail=self._log_tail())
+
+    key = await self._key_from_credential_manager() or await self._mint_key()
+    if key is None:
+        return ConnectResult.needs_key()          # existing dashboard password
+    models = await self._list_models(key)
+    self._write_gateway_json(owned=True)
+    return ConnectResult.ready(models=models)
+
+
+def _env(self) -> dict:
+    return {
+        **os.environ,
+        "PORT": str(self.port),
+        "OMNIROUTE_SERVER_HOST": "127.0.0.1",     # default is 0.0.0.0
+        "DATA_DIR": str(self.state_dir),
+        "INITIAL_PASSWORD": self.password,        # ignored once one is saved
+        "OMNIROUTE_MEMORY_MB": "1024",
+        "OMNIROUTE_SHOW_LOG": "1",
+    }
+```
+
+#### 10.8.8 Remembering the choice
+
+`gateway.connect_on_launch`: `ask` (default) / `auto` / `never`. On `auto` the app starts it
+silently at launch **only after the user has connected manually at least once**, and shows a
+status chip rather than a dialog. Connecting must never block the app from starting — the local
+model works regardless, and the gateway panel simply says "not running".
+
+#### 10.8.9 Testing it (because supervisors fail in boring ways)
+
+- **Fake gateway fixture:** a ~50-line HTTP server answering `/healthz`, `/api/auth/*`,
+  `/api/keys` and `/v1/models`. Test the whole state machine with no Node, no network.
+- **No-orphan test:** start our app, connect, kill our process — assert the child is gone.
+- **Foreign-instance test:** run a dummy listener on 20128, connect, assert we adopted/didn't kill it.
+- **Binding test:** after connect, assert `netstat -ano | findstr 20128` shows `127.0.0.1`, never
+  `0.0.0.0`. This is a security assertion, so make it fail loudly.
+- **Double-click test:** two concurrent `connect()` calls produce one process and one key.
+
+### 10.9 Setup on this machine
+
+**The intended path is the button.** Settings → Free models → **Connect OmniRoute**: the app
+installs the gateway if needed (with consent), starts it bound to `127.0.0.1`, mints its own
+chat-scoped key, and lists models (§10.8). The only thing the user must do afterwards is connect
+a provider in the gateway's dashboard, because provider OAuth is a browser flow we should not
+automate.
+
+```powershell
+# Manual equivalent, for debugging or if you prefer to run it yourself
+npm i -g omniroute
+$env:OMNIROUTE_SERVER_HOST="127.0.0.1"   # default is 0.0.0.0 — do not skip
+$env:PORT="20128"
+omniroute serve                            # NOT --daemon: keep it in the foreground
+# then Dashboard → API Keys → mint a CHAT-scoped key, and paste it into the app
+```
+
+- **Cost on this laptop:** the gateway is a Node process, roughly 150–300 MB RSS. Acceptable on
+  12 GB, but it competes with Ollama — so it starts **only when the user connects**, and the app
+  offers "stop gateway while I work locally". Auto-start-on-launch is opt-in (§10.8.8), never the
+  default.
 - **Alternatives:** run OmniRoute on another machine on the LAN and point `base_url` at it (better
   for RAM, same privacy story), or use the vendor's hosted gateway — in which case say clearly in
-  the UI that a third party is in the request path.
+  the UI that a third party is in the request path. In both cases the Connect button is replaced
+  by a plain "set base URL + key" form; the supervisor only manages a gateway it can reach.
 - **Key storage:** Windows Credential Manager (or DPAPI-encrypted blob), **never** in
   `notebook.db`, never in `app.log`, never in the audit CSV. Scope the key to chat so a leaked key
   cannot reconfigure the gateway.
-- **Never block startup on it.** Detect `127.0.0.1:20128` at launch; if absent, show
-  "Gateway not running — free models disabled" with the command above and move on.
+- **Never block startup on it.** No gateway means "free models unavailable" and the local model
+  carries on; the connect attempt is retried only when the user asks, never in a background loop.
 
-### 10.9 Trust features — build these or don't ship the toggle
+### 10.10 Trust features — build these or don't ship the toggle
 
 - **Attribution badge on every message:** `local · qwen3:4b` or `free cloud · served by X · 2.8 s`.
 - **Egress audit log** (table + UI + CSV export): timestamp, backend, model, decision header,
@@ -943,13 +1124,13 @@ curl.exe http://localhost:20128/v1/chat/completions -H "Authorization: Bearer YO
   JSON that will be sent. Expectation-setting, and it catches accidental title leakage.
 - **No hidden calls.** Ingestion, digests, artefacts and retrieval honour the same policy. A
   notebook set to `local_only` must produce zero outbound inference requests — enforce it with a
-  test that swaps in a transport which raises on any connection (§10.11).
+  test that swaps in a transport which raises on any connection (§10.12).
 - **Don't let the gateway rewrite your sources.** OmniRoute advertises prompt compression
   (15–95% token savings). Verbatim quotes and citation offsets are the product's core promise, so
   disable compression for source text where request-level overrides exist; if you can't, verify
   quotes against the local chunk and flag any answer whose quotation does not match exactly.
 
-### 10.10 Caveats to put in the README, not just in your head
+### 10.11 Caveats to put in the README, not just in your head
 
 | Caveat | Reality |
 |---|---|
@@ -961,7 +1142,7 @@ curl.exe http://localhost:20128/v1/chat/completions -H "Authorization: Bearer YO
 | Jurisdiction | Prompts may be processed outside your country. Say so. |
 | Guarantees | No SLA, no support, no reproducibility — pin `auto/*` behaviour, not model snapshots, and accept drift. |
 
-### 10.11 Evaluation across backends
+### 10.12 Evaluation across backends
 
 Run the §14 golden set twice — `local_only` and `cloud_allowed` — and report the delta:
 
@@ -1018,7 +1199,7 @@ Rules that matter on slow hardware:
   directly under the answer it would replace.
 - **Egress is legible at a glance:** a small lock icon for `local_only`, an outlined cloud icon
   for policies that can send data, and a one-time confirmation before a notebook's first outbound
-  call showing exactly what will be transmitted (§10.9).
+  call showing exactly what will be transmitted (§10.10).
 - The tier toggle belongs **in the chat box**, not buried in settings — it is the primary
   latency control and users should be able to trade speed for depth per question.
 - Offline fonts, no CDN, no analytics, no telemetry.
@@ -1043,9 +1224,12 @@ Rules that matter on slow hardware:
 | `GET/PUT /api/settings` | Model, context, threads, strict mode, egress defaults |
 | `GET/PUT /api/notebooks/{id}/egress` | Per-notebook policy: `local_only` / `escalate_on_demand` / `cloud_allowed` |
 | `GET /api/providers`, `POST /api/providers/{id}/test` | Backend status; gateway reachability, key validity, latency |
+| `POST /api/providers/omniroute/connect` (SSE) | Install-if-consented → start → mint key → list models; emits `state` events (§10.8.1) |
+| `POST /api/providers/omniroute/disconnect` | Graceful stop **only if we started it** (`owned`) |
+| `GET /api/providers/omniroute/status` | `stopped │ starting │ ready │ needs_key │ foreign_instance │ failed`, plus pid/port/uptime/models |
 | `GET /api/providers/omniroute/models` | Proxy of `GET /v1/models` + `/v1/models/health`, grouped, free-first |
 | `POST /api/chat/preview` | The exact payload egress would send, for the confirmation dialog |
-| `GET /api/egress?notebook_id=&format=csv` | Audit log read/export (§10.9) |
+| `GET /api/egress?notebook_id=&format=csv` | Audit log read/export (§10.10) |
 | `DELETE /api/providers/{id}/key` | Forget the stored gateway key |
 
 SSE event shape:
@@ -1058,6 +1242,15 @@ event: warning    data: {"unsupported":1}
 event: done       data: {"tokens_out":184,"ms":38210,"tok_s":4.8,
                         "backend":"omniroute","served_by":"gc/gemini-3-flash","complete":true}
 event: blocked    data: {"reason":"egress_policy","policy":"local_only"}
+```
+
+Connect progress uses the same stream shape, so one client handles both:
+
+```
+event: state      data: {"state":"installing","pct":42,"detail":"npm i -g omniroute@3.8.53"}
+event: state      data: {"state":"starting","elapsed_s":12}
+event: state      data: {"state":"ready","port":20128,"models":42,"owned":true}
+event: state      data: {"state":"needs_key","why":"existing_password"}
 ```
 
 `backend`/`served_by` on `done` is what the attribution line renders; `blocked` is what the UI
@@ -1075,12 +1268,12 @@ Assumes one developer, part-time evenings/weekends. "Done" means demoable, not m
 | M1 | **Vertical slice** | Schema, upload PDF/TXT, extract, chunk, embed, FTS+vector retrieve, grounded chat with citations (CLI or minimal UI) | Ask 3 questions about a 20-page PDF; every answer cites a real page | 3–5 evenings |
 | M2 | **Usable app** | Job queue + progress + resume, 3-pane UI, streaming + stop, in-chat tier toggle, citation drawer with highlight, notes, settings/health | Ingest 5 sources while chatting; kill the app mid-ingest and it resumes | 3–5 evenings |
 | M3 | **Digests & studio** | Per-source summaries/topics/questions, notebook brief, FAQ/study guide/timeline/mind map, export to Markdown | One click produces a useful study guide with valid citations | 3–4 evenings |
-| M4 | **Optional free cloud (§10)** | `ChatBackend` interface, OpenAI-compatible client, egress guard + policies, model picker from `/v1/models`, attribution + audit log, quota/fallback rules | A question answered by a free cloud model with a working "served by" badge and an audit row — and zero outbound calls when the notebook is `local_only` | 2–3 evenings |
+| M4 | **Optional free cloud (§10)** | `ChatBackend` interface, OpenAI-compatible client, egress guard + policies, **one-click connect** (supervisor, key minting, install-on-demand, Job Object), model picker from `/v1/models`, attribution + audit log, quota/fallback rules | Click **Connect OmniRoute** on a machine where it was never installed, and reach an answer from a free cloud model — with a working "served by" badge, an audit row, no terminal window, and no orphan process after quitting | 4–5 evenings |
 | M5 | **Hardening** | Golden-set eval (both backends), refusal threshold, optional rerank, OCR, packaging (`run.bat`/`run.sh`), backups | Fresh machine → install → ask a question in <10 min | 3–5 evenings |
 | M6 | **Audio (optional)** | Piper narration of an existing summary; optional two-voice script | 3-minute audio overview generated in <2 min of CPU | 2–3 evenings |
 
 Total for v1 (M0–M3): roughly **10–15 evenings**; with the optional cloud backend (M4) add
-**2–3 evenings**.
+**4–5 evenings** — half of it is the process supervisor, which is where the sharp edges are.
 
 ---
 
@@ -1100,7 +1293,7 @@ catches regressions when you change models, prompts, or chunk size.
 - **Throughput drift:** `tok/s` at minute 1 vs minute 10 of a long job. >30% drop = thermal
   throttling on this 15 W chip, and it is a hardware fact to design around, not a bug to chase.
 - **Ingestion:** minutes per 100 pages, failure rate by file type.
-- **Cross-backend delta (§10.11):** run the same set in `local_only` and `cloud_allowed`; compare
+- **Cross-backend delta (§10.12):** run the same set in `local_only` and `cloud_allowed`; compare
   citation validity, faithfulness and latency. Ship the cloud toggle only if the delta justifies it.
 - **No-egress assertion:** in `local_only`, every non-localhost socket raises in tests. A failing
   suite here is a privacy incident, not a bug.
@@ -1134,11 +1327,17 @@ change; a "better" model that doubles latency may be the wrong trade on this mac
 | Defender real-time scanning doubles ingest and load times | High | Folder exclusions for the model dir and `data/` (§9.5 step 3) |
 | Windows sleep interrupts ingestion | Medium | Resumable stage-level jobs (§7); optional timeout bump while working |
 | Fluent wrong answers feel authoritative and users stop checking citations | Medium | Keep citation verification on cloud answers too; never let the attribution line imply human review |
-| Free cloud provider trains on submitted documents | **High** | Off by default; per-notebook policy; explicit first-call confirmation; payload preview; README caveats (§10.10) |
+| Free cloud provider trains on submitted documents | **High** | Off by default; per-notebook policy; explicit first-call confirmation; payload preview; README caveats (§10.11) |
 | Sensitive filename leaks in a prompt | Medium | Neutral source labels in cloud mode (`[S1] (p.12)`), optional redaction pass, payload preview (§10.2) |
 | Gateway key leaks into logs, SQLite or a backup | Medium | Credential-Manager/DPAPI storage, chat-only key scope, log scrubbing test, `key_ref` never the key |
 | A free model disappears or a quota runs out mid-session | **High** | Never hardcode model IDs; `auto/*` presets + pinned chain; quota guard; fall back to local before first token (§10.5) |
 | Free-tier ToS violation (unofficial OAuth bridges) | Medium | Prefer documented API-key tiers; state the risk in the README; never ship a scraped-token default |
+| **Auto-started gateway binds `0.0.0.0`** (its default) and exposes the dashboard + provider credentials to the LAN | **High** | Always set `OMNIROUTE_SERVER_HOST=127.0.0.1`; assert it in a test that greps `netstat`; never reuse a user's env that overrides it |
+| Orphaned gateway process after our app crashes | Medium | Job Object with `KILL_ON_JOB_CLOSE`; `gateway.json` PID record; adopt-and-clean on next launch |
+| We kill a gateway the user started themselves | Medium | `owned` flag: adopt on connect, never terminate unless we spawned it |
+| Auto-install pulls a broken or malicious npm release | Medium | Pin the version, show the exact command and size before installing, no silent auto-update, surface `npm` output |
+| Existing dashboard password is the npm placeholder `CHANGEME` | Medium | Detect via `/api/auth/status` and warn; never attempt default credentials; point at `omniroute reset-password` |
+| Connect loop spins on a permanently broken gateway | Low | Two failed attempts then stop offering; log once; keep the app usable locally |
 | Model licensing surprises | Low | Prefer Apache-2.0 (Qwen) / MIT-family; check Gemma and Llama terms before redistribution |
 
 ---
@@ -1162,7 +1361,7 @@ change; a "better" model that doubles latency may be the wrong trade on this mac
    default with a one-click cloud retry) the right default for *your* documents? The plan assumes
    `local_only`; if your corpus is entirely public material, `escalate_on_demand` is a better
    product.
-9. **Gateway hosting (§10.8):** run OmniRoute on this laptop (simplest, ~200 MB RAM), on another
+9. **Gateway hosting (§10.9):** run OmniRoute on this laptop (simplest, ~200 MB RAM), on another
    machine on the LAN (better for RAM), or use the vendor's hosted endpoint (a third party in the
    request path)? Each changes what "private" means in the README.
 
@@ -1202,15 +1401,20 @@ Desktop, which are usually OneDrive-redirected (§9.5 step 4).
 
 **Optional — free cloud models (§10).** Skip entirely if the app is to stay offline.
 
+1. In the app: Settings → Free models → **Connect OmniRoute**. It installs (with consent), starts
+   the gateway on `127.0.0.1:20128`, mints a chat-scoped key, and lists models (§10.8).
+2. In the gateway dashboard it opens: connect one free provider (or accept the keyless `auto`
+   defaults).
+
+Verify it is not exposed beyond this machine — this must print `127.0.0.1:20128`, never
+`0.0.0.0:20128`:
+
 ```powershell
-npm i -g omniroute            # requires Node LTS
-omniroute                     # dashboard + API on http://localhost:20128
-# Dashboard → API Keys → mint a key scoped to CHAT ONLY, then paste it into the app's settings
-curl.exe http://localhost:20128/v1/models -H "Authorization: Bearer YOUR_KEY"
+netstat -ano | findstr :20128
 ```
 
-The app should start fine without it, showing "free models unavailable" and never retrying in a
-loop.
+The app must start fine without any of this, showing "free models unavailable" and never retrying
+in a loop.
 
 ## Appendix B — Model bake-off script
 
@@ -1297,6 +1501,18 @@ Defaults chosen for this machine. The bake-off (§Appendix B) overwrites the num
     "omniroute": {"kind": "openai_compat", "base_url": "http://127.0.0.1:20128/v1",
                   "key_ref": "credential://TimNotebook/omniroute", "enabled": false}
   },
+  "gateway": {
+    "kind": "omniroute",
+    "autostart": "ask",
+    "port": 20128,
+    "host": "127.0.0.1",
+    "data_dir": "%LOCALAPPDATA%/TimNotebook/omniroute",
+    "memory_mb": 1024,
+    "pinned_version": "3.8.x",
+    "install_on_demand": "ask",
+    "start_timeout_s": 90,
+    "credential_target": "TimNotebook/omniroute"
+  },
   "egress": {
     "default_policy": "local_only",
     "send_source_titles": false,
@@ -1332,6 +1548,7 @@ Tim_doc-Extractor/
 │   ├── api/                 # notebooks, sources, chat, jobs, notes, search, settings
 │   ├── core/               # config, db, migrations, inference gate
 │   ├── backends/           # ollama.py, openai_compat.py (OmniRoute), egress guard, quota
+│   │                       #   gateway_manager.py — spawn/adopt/stop, Job Object, key minting
 │   ├── ingest/             # extract, chunk, embed, queue
 │   ├── rag/                # retrieve, prompt, citations, verify
 │   └── web/                # index.html, app.js, styles.css, vendor/
@@ -1372,6 +1589,7 @@ and §9.4, and they are what you tune the defaults against.
 | 10 | While generating, Task Manager → CPU sustained all-core clock | ______ GHz |
 | 11 | While generating, Resource Monitor → Commit, and `ollama ps` SIZE | ______ GB / ______ GB |
 | 12 | Time one real answer end to end, by hand, with a watch | ______ s |
+| 13 | *Optional:* click **Connect OmniRoute**, then `netstat -ano \| findstr :20128` | `127.0.0.1:20128` (never `0.0.0.0`) |
 
 **Then decide, and write it down in this file:**
 

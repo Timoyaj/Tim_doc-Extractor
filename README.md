@@ -25,6 +25,9 @@ them, and get answers with clickable citations — powered by a local model thro
   click answers the same question with a 70B-class free model in a few seconds. **Off by
   default**, per notebook, and every answer is labelled with who produced it — see
   [PLAN.md §10](PLAN.md#10-optional-online-mode-free-models-via-omniroute).
+- **One click starts it.** No terminal, no copy-pasted commands: the app installs the gateway if
+  needed, launches it bound to loopback, mints its own chat-scoped key and stops it again on
+  disconnect ([PLAN.md §10.8](PLAN.md#108-one-click-connect-the-app-starts-the-gateway)).
 
 ## Local by default
 
@@ -46,8 +49,8 @@ py -3.12 -m venv .venv
 pip install fastapi uvicorn pymupdf4llm markitdown trafilatura sqlite-vec psutil httpx
 python -m timnb                 # http://127.0.0.1:8765
 
-# optional: free cloud models when the local 4B isn't enough
-npm i -g omniroute && omniroute    # gateway + dashboard on :20128
+# optional: free cloud models when the local 4B isn't enough.
+# No commands — in the app, Settings → Free models → Connect OmniRoute.
 ```
 
 First read [PLAN.md §9.5](PLAN.md#95-windows-11-specifics-do-these-once-in-this-order) — four
