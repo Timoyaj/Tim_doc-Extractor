@@ -28,6 +28,11 @@ them, and get answers with clickable citations — powered by a local model thro
 - **One click starts it.** No terminal, no copy-pasted commands: the app installs the gateway if
   needed, launches it bound to loopback, mints its own chat-scoped key and stops it again on
   disconnect ([PLAN.md §10.8](PLAN.md#108-one-click-connect-the-app-starts-the-gateway)).
+- **Notes land in your Obsidian vault.** Any note or saved answer can be sent straight into a
+  vault as plain Markdown — YAML frontmatter, working wikilinks to source notes, atomic writes,
+  and re-export that never clobbers an edit you made in Obsidian. Vault auto-detected; no plugin,
+  no Obsidian running required. See
+  [PLAN.md §11](PLAN.md#11-obsidian-notes-land-in-your-vault).
 
 ## Local by default
 
@@ -51,6 +56,7 @@ python -m timnb                 # http://127.0.0.1:8765
 
 # optional: free cloud models when the local 4B isn't enough.
 # No commands — in the app, Settings → Free models → Connect OmniRoute.
+# optional: Settings → Obsidian → pick your vault; then "Send to Obsidian" on any note.
 ```
 
 First read [PLAN.md §9.5](PLAN.md#95-windows-11-specifics-do-these-once-in-this-order) — four
@@ -70,5 +76,5 @@ of OneDrive) that save hours. Tune the defaults with the
 | M5 | Evaluation harness, OCR, packaging |
 | M6 | Audio overview via local TTS (optional) |
 
-See [PLAN.md §16](PLAN.md#16-open-decisions-for-you) for the open decisions that shape the
+See [PLAN.md §17](PLAN.md#17-open-decisions-for-you) for the open decisions that shape the
 defaults — hardware, document mix, build-vs-adopt, and UI stack.
